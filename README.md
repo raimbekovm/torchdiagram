@@ -91,6 +91,23 @@ Pre-alpha. The core pipeline works end-to-end:
 
 **Known limitation:** `torch.fx` symbolic tracing cannot handle data-dependent control flow (e.g. `if x.sum() > 0:` inside `forward()`). This is the standard fx restriction; a fallback tracer is on the roadmap.
 
+## FAQ
+
+**Does torchdiagram require a LaTeX installation?**
+No. Generating SVG or TikZ output needs no LaTeX toolchain; LaTeX is only required if you want to compile the generated `.tex` file yourself with `pdflatex` or `tectonic`.
+
+**Does tracing a model require a GPU?**
+No. `torch.fx` symbolic tracing and shape propagation both run on CPU tensors; the example input passed to `trace()` only needs to match the shape and dtype `forward()` expects.
+
+**Can it diagram models with residual connections or branching, like ResNet or a Transformer block?**
+Yes. Because the diagram comes from a real `torch.fx` trace of `forward()`, residual connections, parallel branches, and functional ops (`torch.relu`, `x + y`, `x.view(...)`) are captured as part of the graph rather than requiring manual annotation.
+
+**What happens if my model has data-dependent control flow (`if x.sum() > 0:`)?**
+`trace()` raises `torch.fx.proxy.TraceError`, since symbolic tracing cannot execute a branch that depends on tensor values rather than static shape. A fallback frontend based on `torch.export` is planned to cover this case.
+
+**Can I edit the diagram after generating it?**
+Yes, at two levels: the intermediate `Graph` returned by `trace()` is a plain dataclass you can modify (rename labels, drop nodes) before rendering, and the rendered SVG is editable in any vector graphics editor while the TikZ output is plain LaTeX you can edit directly.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup and guidelines. Bug reports with a minimal model snippet are especially useful.
