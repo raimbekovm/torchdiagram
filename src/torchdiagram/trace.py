@@ -29,6 +29,13 @@ def trace(
         model: Module to trace; ``forward()`` may be arbitrary fx-traceable code.
         example_input: When given, a forward pass is shape-propagated so every node carries its output shape.
         name: Diagram title; defaults to the model's class name.
+
+    Returns:
+        The traced graph, with nodes in execution order.
+
+    Raises:
+        torch.fx.proxy.TraceError: If ``model`` is not symbolically traceable, e.g. due to data-dependent control flow
+            in ``forward()``.
     """
     graph_module = torch.fx.symbolic_trace(model)
     if example_input is not None:
@@ -51,6 +58,15 @@ def trace(
 
 
 def _to_ir(fx_node: torch.fx.Node, graph_module: torch.fx.GraphModule) -> Node | None:
+    """Convert a single fx node into an IR ``Node``, or ``None`` if it carries no diagram content.
+
+    Args:
+        fx_node: Node from the traced fx graph.
+        graph_module: The graph module ``fx_node`` belongs to, used to resolve submodules.
+
+    Returns:
+        The corresponding IR node, or ``None`` for ``get_attr`` nodes (parameter/buffer plumbing).
+    """
     shape = _output_shape(fx_node)
     if fx_node.op == "placeholder":
         return Node(id=fx_node.name, op="input", label="input", output_shape=shape)
@@ -77,6 +93,7 @@ def _to_ir(fx_node: torch.fx.Node, graph_module: torch.fx.GraphModule) -> Node |
 
 
 def _output_shape(fx_node: torch.fx.Node) -> tuple[int, ...] | None:
+    """Read the shape-propagated output shape of ``fx_node``, if available."""
     meta = fx_node.meta.get("tensor_meta")
     shape = getattr(meta, "shape", None)
     return tuple(shape) if shape is not None else None

@@ -13,21 +13,31 @@ from typing import Any
 
 @dataclass
 class Node:
-    """A single block in the diagram: a layer, a function call, or a graph input/output."""
+    """A single block in the diagram: a layer, a function call, or a graph input/output.
+
+    Attributes:
+        id: Unique identifier, referenced by edges.
+        op: Normalized operation kind, e.g. ``"conv2d"``, ``"add"``, ``"input"``.
+        label: Human-readable text shown on the diagram.
+        params: Layer configuration, e.g. ``{"config": "3, 16, kernel_size=(3, 3)"}``.
+        output_shape: Output tensor shape, populated when tracing runs with an example input.
+    """
 
     id: str
     op: str
-    """Normalized operation kind, e.g. ``"conv2d"``, ``"add"``, ``"input"``."""
     label: str
-    """Human-readable text shown on the diagram."""
     params: dict[str, Any] = field(default_factory=dict)
-    """Layer configuration, e.g. ``{"config": "3, 16, kernel_size=(3, 3)"}``."""
     output_shape: tuple[int, ...] | None = None
 
 
 @dataclass
 class Edge:
-    """A directed data-flow edge between two nodes, referenced by node id."""
+    """A directed data-flow edge between two nodes, referenced by node id.
+
+    Attributes:
+        source: Id of the source node.
+        target: Id of the target node.
+    """
 
     source: str
     target: str
@@ -35,14 +45,24 @@ class Edge:
 
 @dataclass
 class Graph:
-    """An ordered model graph; node order is the topological (execution) order."""
+    """An ordered model graph; node order is the topological (execution) order.
+
+    Attributes:
+        name: Diagram title.
+        nodes: Nodes in execution order.
+        edges: Directed data-flow edges.
+    """
 
     name: str = "model"
     nodes: list[Node] = field(default_factory=list)
     edges: list[Edge] = field(default_factory=list)
 
     def validate(self) -> None:
-        """Raise :class:`ValueError` on duplicate node ids or dangling edge references."""
+        """Check internal consistency of the graph.
+
+        Raises:
+            ValueError: If two nodes share an id, or an edge references an id not present in ``nodes``.
+        """
         ids = [node.id for node in self.nodes]
         unique = set(ids)
         if len(unique) != len(ids):

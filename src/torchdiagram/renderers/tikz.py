@@ -23,7 +23,14 @@ _PREAMBLE = [
 
 
 def to_tikz(graph: Graph) -> str:
-    """Render ``graph`` as a standalone LaTeX/TikZ document string."""
+    """Render ``graph`` as a standalone LaTeX/TikZ document string.
+
+    Args:
+        graph: Graph to render, in execution order.
+
+    Returns:
+        A complete, compilable LaTeX document as a string. Labels are escaped for LaTeX.
+    """
     index = {node.id: i for i, node in enumerate(graph.nodes)}
     lines = list(_PREAMBLE)
 
@@ -45,6 +52,7 @@ def to_tikz(graph: Graph) -> str:
 
 
 def _node_text(node: Node) -> str:
+    """Build the LaTeX label text for a node, including its output shape if known."""
     text = _escape(node.label)
     if node.output_shape is not None:
         shape = r"$\times$".join(str(dim) for dim in node.output_shape)
@@ -53,7 +61,14 @@ def _node_text(node: Node) -> str:
 
 
 def _escape(text: str) -> str:
-    """Escape LaTeX special characters in diagram labels."""
+    """Escape LaTeX special characters in diagram labels.
+
+    Args:
+        text: Raw label text.
+
+    Returns:
+        Text safe to embed in a LaTeX document.
+    """
     out = []
     for char in text:
         if char == "\\":

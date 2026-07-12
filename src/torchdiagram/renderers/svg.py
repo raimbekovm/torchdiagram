@@ -24,7 +24,14 @@ _FONT = "'Helvetica Neue', Helvetica, Arial, sans-serif"
 
 
 def to_svg(graph: Graph) -> str:
-    """Render ``graph`` as a self-contained SVG document string."""
+    """Render ``graph`` as a self-contained SVG document string.
+
+    Args:
+        graph: Graph to render, in execution order.
+
+    Returns:
+        A complete SVG document as a string.
+    """
     lines_by_id = {node.id: _label_lines(node) for node in graph.nodes}
     two_line = any(len(lines) > 1 for lines in lines_by_id.values())
     box_h = 46 if two_line else 34
@@ -90,6 +97,7 @@ def to_svg(graph: Graph) -> str:
 
 
 def _text(x: float, y: float, content: str, *, size: int, fill: str = "#2e3440") -> str:
+    """Build a centered SVG ``<text>`` element."""
     return (
         f'<text x="{x}" y="{y}" text-anchor="middle" dominant-baseline="central" '
         f'font-size="{size}" fill="{fill}">{escape(content)}</text>'
@@ -97,6 +105,7 @@ def _text(x: float, y: float, content: str, *, size: int, fill: str = "#2e3440")
 
 
 def _label_lines(node: Node) -> list[str]:
+    """Split ``node`` into the one or two text lines rendered inside its box."""
     lines = [node.label]
     if node.output_shape is not None:
         lines.append("×".join(str(dim) for dim in node.output_shape))

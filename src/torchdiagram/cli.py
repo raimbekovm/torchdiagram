@@ -15,7 +15,11 @@ from torchdiagram.trace import trace
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Entry point for the ``torchdiagram`` command."""
+    """Run the ``torchdiagram`` command-line entry point.
+
+    Args:
+        argv: Command-line arguments to parse, excluding the program name. Defaults to ``sys.argv[1:]`` when ``None``.
+    """
     parser = argparse.ArgumentParser(
         prog="torchdiagram",
         description="Generate an architecture diagram from a PyTorch model.",
@@ -42,6 +46,19 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def _load_model(spec: str) -> nn.Module:
+    """Resolve an ``nn.Module`` instance from an import spec.
+
+    Args:
+        spec: Import path in the form ``"package.module:attr"``, where ``attr`` is an ``nn.Module`` instance, an
+            ``nn.Module`` subclass, or a zero-argument factory function returning one.
+
+    Returns:
+        The resolved module instance.
+
+    Raises:
+        SystemExit: If ``spec`` is malformed, the module cannot be imported, or ``attr`` does not resolve to an
+            ``nn.Module``.
+    """
     module_path, _, attr = spec.partition(":")
     if not attr:
         raise SystemExit(f"error: expected 'package.module:attr', got {spec!r}")
