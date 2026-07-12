@@ -1,0 +1,26 @@
+name: Bug report
+description: Wrong diagram, tracing failure, or crash
+labels: [bug]
+body:
+  - type: textarea
+    id: model
+    attributes:
+      label: Minimal model
+      description: The smallest nn.Module (or import path) that reproduces the problem.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: What you ran and what happened
+      description: The exact code or CLI command, plus the error message or a description of the wrong output. Attach the generated SVG/TikZ if relevant.
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      placeholder: "torchdiagram 0.1.0, torch 2.7.0, Python 3.12, macOS 15"
+    validations:
+      required: true
