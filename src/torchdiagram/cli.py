@@ -12,6 +12,7 @@ from torch import nn
 
 from torchdiagram.renderers import render
 from torchdiagram.trace import trace
+from torchdiagram.transforms import aggregate_blocks
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -38,6 +39,17 @@ def main(argv: list[str] | None = None) -> None:
         "--input-shape",
         help="Comma-separated input shape, e.g. '1,3,224,224'; enables shape annotations on every node.",
     )
+    parser.add_argument(
+        "--aggregate",
+        action="store_true",
+        help="Collapse runs of repeated, structurally identical blocks (e.g. ResNet layers) into one node.",
+    )
+    parser.add_argument(
+        "--min-repeats",
+        type=int,
+        default=None,
+        help="Minimum run length required to collapse with --aggregate (default: 2).",
+    )
     args = parser.parse_args(argv)
 
     model = _load_model(args.model)
@@ -46,6 +58,9 @@ def main(argv: list[str] | None = None) -> None:
         graph = trace(model, example)
     except torch.fx.proxy.TraceError as exc:
         raise SystemExit(f"error: cannot trace {args.model!r}: {exc}") from exc
+    if args.aggregate:
+        min_repeats_kwargs = {} if args.min_repeats is None else {"min_repeats": args.min_repeats}
+        graph = aggregate_blocks(graph, **min_repeats_kwargs)
     try:
         path = render(graph, args.output)
     except ValueError as exc:

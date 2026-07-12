@@ -34,6 +34,17 @@ Validate `graph` and write it to `path`, selecting the format from the file exte
 
 Returns the written path. Raises `ValueError` for an unsupported extension or an invalid graph (see `Graph.validate`).
 
+### `td.aggregate_blocks(graph, *, min_repeats=2) -> Graph`
+
+Collapse runs of repeated, structurally identical blocks (e.g. ResNet layers) into a single labeled node.
+
+| Parameter     | Type    | Description                                                             |
+| ------------- | ------- | ----------------------------------------------------------------------- |
+| `graph`       | `Graph` | Graph to transform. Not mutated.                                        |
+| `min_repeats` | `int`   | Minimum run length, in groups, required to collapse a run. Default `2`. |
+
+Groups nodes by the module scope they were traced from (see `Node.scope`), then merges consecutive groups that share a `scope_class` and an identical internal structure into one synthetic node with `op="block"`, `label` like `"BasicBlock ×5"`, and `params={"repeats": ..., "block_class": ..., "ops_per_repeat": ...}`. Groups that aren't single-entry/single-exit, or whose structure differs from their neighbors, are left untouched — a stage's non-uniform first block (e.g. a downsample variant) stays expanded rather than being merged incorrectly. Pure function; returns a new, validated graph. See [aggregating repeated blocks](usage.md#aggregating-repeated-blocks).
+
 ### `td.to_svg(graph) -> str`
 
 Render `graph` as a self-contained SVG document string. Pure function; does not validate the graph or touch the filesystem.
@@ -62,13 +73,15 @@ An ordered model graph. Node order in `nodes` is the topological (execution) ord
 
 A single block in the diagram: a layer, a function call, or a graph input/output.
 
-| Field          | Type                      | Default | Description                                                                                  |
-| -------------- | ------------------------- | ------- | -------------------------------------------------------------------------------------------- |
-| `id`           | `str`                     | —       | Unique identifier, referenced by edges.                                                      |
-| `op`           | `str`                     | —       | Normalized operation kind, e.g. `"conv2d"`, `"add"`, `"input"`, `"output"`.                  |
-| `label`        | `str`                     | —       | Human-readable text shown on the diagram.                                                    |
-| `params`       | `dict[str, Any]`          | `{}`    | Layer configuration; the tracer stores the module's `extra_repr()` under the `"config"` key. |
-| `output_shape` | `tuple[int, ...] \| None` | `None`  | Output tensor shape, populated when `trace()` receives an `example_input`.                   |
+| Field          | Type                      | Default | Description                                                                                        |
+| -------------- | ------------------------- | ------- | -------------------------------------------------------------------------------------------------- |
+| `id`           | `str`                     | —       | Unique identifier, referenced by edges.                                                            |
+| `op`           | `str`                     | —       | Normalized operation kind, e.g. `"conv2d"`, `"add"`, `"input"`, `"output"`.                        |
+| `label`        | `str`                     | —       | Human-readable text shown on the diagram.                                                          |
+| `params`       | `dict[str, Any]`          | `{}`    | Layer configuration; the tracer stores the module's `extra_repr()` under the `"config"` key.       |
+| `output_shape` | `tuple[int, ...] \| None` | `None`  | Output tensor shape, populated when `trace()` receives an `example_input`.                         |
+| `scope`        | `str \| None`             | `None`  | Dotted path of the immediate custom-container module this node was traced from, e.g. `"layer1.0"`. |
+| `scope_class`  | `str \| None`             | `None`  | Class name of that container, e.g. `"BasicBlock"`, or `None` alongside `scope`.                    |
 
 `op` values produced by the tracer: `"input"` and `"output"` for graph boundaries, the lowercased class name for submodule calls (`"conv2d"`, `"linear"`, `"maxpool2d"`, ...), and the function or method name for functional ops (`"relu"`, `"add"`, `"flatten"`, `"view"`, ...).
 

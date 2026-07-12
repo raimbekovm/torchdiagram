@@ -21,6 +21,9 @@ class Node:
         label: Human-readable text shown on the diagram.
         params: Layer configuration, e.g. ``{"config": "3, 16, kernel_size=(3, 3)"}``.
         output_shape: Output tensor shape, populated when tracing runs with an example input.
+        scope: Dotted path of the immediate custom-container module this node was traced from, e.g. ``"layer1.0"``, or
+            ``None`` if the node isn't nested in one.
+        scope_class: Class name of that container, e.g. ``"BasicBlock"``, or ``None`` alongside ``scope``.
     """
 
     id: str
@@ -28,6 +31,8 @@ class Node:
     label: str
     params: dict[str, Any] = field(default_factory=dict)
     output_shape: tuple[int, ...] | None = None
+    scope: str | None = None
+    scope_class: str | None = None
 
     @property
     def is_io(self) -> bool:

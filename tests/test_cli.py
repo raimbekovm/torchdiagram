@@ -14,6 +14,23 @@ def test_cli_end_to_end(tmp_path):
     assert "×28×28" in content  # shape annotations flowed through
 
 
+def test_cli_aggregate_flag_collapses_repeated_layers(tmp_path):
+    """'--aggregate' collapses a repeated block stack into a single labeled node."""
+    output = tmp_path / "stack.svg"
+    main(["tests.models:RepeatedBlockStack", "-o", str(output), "--aggregate"])
+    content = output.read_text()
+    assert "BasicBlock" in content
+    assert "×4" in content
+
+
+def test_cli_omits_aggregation_by_default(tmp_path):
+    """Without '--aggregate', the output shows individual layers, not a collapsed block."""
+    output = tmp_path / "stack.svg"
+    main(["tests.models:RepeatedBlockStack", "-o", str(output)])
+    content = output.read_text()
+    assert "×4" not in content
+
+
 def test_cli_rejects_bad_import_path():
     """A non-importable model spec exits with a clear error."""
     with pytest.raises(SystemExit, match="cannot import"):

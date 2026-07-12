@@ -49,6 +49,28 @@ graph = td.trace(model, name="Encoder v2")
 
 Models that are fully defined in terms of submodule calls, tensor functions, and tensor methods — which covers most convolutional and transformer architectures — trace without modification.
 
+### Aggregating repeated blocks
+
+Deep models trace to hundreds of nodes — a ResNet-50 is 177. `aggregate_blocks()` collapses runs of repeated, structurally identical blocks into a single labeled node before rendering:
+
+```python
+graph = td.trace(model, example_input)
+graph = td.aggregate_blocks(graph)
+td.render(graph, "model.svg")
+```
+
+It groups nodes by the submodule they were traced from (`Node.scope`/`scope_class`, set by `trace()`), then merges consecutive groups that share the same class and internal structure into one node — `op="block"`, `label` like `"BasicBlock ×5"`, and `params={"repeats": 5, "block_class": "BasicBlock", "ops_per_repeat": 5}`.
+
+Only exact structural matches merge. A stage whose first block differs from the rest — for example a ResNet stage's first `Bottleneck`, which has an extra downsample convolution on the shortcut — stays expanded as individual nodes; the remaining uniform blocks collapse into one. This is expected, not a bug: it keeps the diagram from misrepresenting a block that isn't actually identical to its neighbors.
+
+`min_repeats` (default `2`) sets how many consecutive matching blocks are required before they collapse:
+
+```python
+graph = td.aggregate_blocks(graph, min_repeats=3)  # only collapse runs of 3 or more
+```
+
+`aggregate_blocks()` is a pure function — it returns a new graph and does not modify its input — and is opt-in: `trace()` and `render()` never call it implicitly.
+
 ## Rendering
 
 ### Choosing a format

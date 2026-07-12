@@ -5,16 +5,18 @@ The `torchdiagram` command traces a model given by an import path and writes a r
 ## Synopsis
 
 ```bash
-torchdiagram MODEL -o OUTPUT [--input-shape SHAPE]
+torchdiagram MODEL -o OUTPUT [--input-shape SHAPE] [--aggregate] [--min-repeats N]
 ```
 
 ## Arguments
 
-| Argument         | Required | Description                                                                                      |
-| ---------------- | -------- | ------------------------------------------------------------------------------------------------ |
-| `MODEL`          | yes      | Import path to the model in the form `package.module:attr`.                                      |
-| `-o`, `--output` | yes      | Output file. The format is selected by extension: `.svg`, `.tex`, or `.tikz`.                    |
-| `--input-shape`  | no       | Comma-separated input shape, e.g. `1,3,224,224`. Enables output-shape annotations on every node. |
+| Argument         | Required | Description                                                                                                  |
+| ---------------- | -------- | ------------------------------------------------------------------------------------------------------------ |
+| `MODEL`          | yes      | Import path to the model in the form `package.module:attr`.                                                  |
+| `-o`, `--output` | yes      | Output file. The format is selected by extension: `.svg`, `.tex`, or `.tikz`.                                |
+| `--input-shape`  | no       | Comma-separated input shape, e.g. `1,3,224,224`. Enables output-shape annotations on every node.             |
+| `--aggregate`    | no       | Collapse runs of repeated, structurally identical blocks (e.g. ResNet layers) into one node. Off by default. |
+| `--min-repeats`  | no       | Minimum run length required to collapse with `--aggregate` (default: `2`).                                   |
 
 ## Model specification
 
@@ -43,6 +45,9 @@ torchdiagram my_models:ResidualBlock -o block.svg --input-shape 1,64,56,56
 
 # Standalone TikZ document from an installed package
 torchdiagram torchvision.models:resnet18 -o resnet18.tex --input-shape 1,3,224,224
+
+# Collapse repeated residual blocks into single labeled nodes
+torchdiagram torchvision.models:resnet50 -o resnet50.svg --input-shape 1,3,224,224 --aggregate
 ```
 
 ## Exit behavior

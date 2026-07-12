@@ -79,6 +79,8 @@ def _escape(text: str) -> str:
             out.append(r"\textasciicircum{}")
         elif char in "{}_#&$%":
             out.append("\\" + char)
+        elif char == "×":
+            out.append(r"$\times$")
         else:
             out.append(char)
     return "".join(out)

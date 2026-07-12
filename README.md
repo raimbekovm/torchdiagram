@@ -41,6 +41,8 @@ td.render(graph, "block.tex")  # standalone TikZ/LaTeX document
 
 The example input is optional; when provided, every node in the diagram is annotated with its output shape.
 
+For deep models, `td.aggregate_blocks(graph)` collapses runs of repeated blocks (e.g. ResNet layers) into a single labeled node before rendering — see [the user guide](docs/usage.md#aggregating-repeated-blocks).
+
 The same pipeline is available from the command line:
 
 ```bash
@@ -82,7 +84,7 @@ Pre-alpha. The core pipeline works end-to-end:
 - [x] SVG renderer with skip-edge routing
 - [x] TikZ renderer (standalone compilable document)
 - [x] CLI (`torchdiagram pkg.module:Model -o out.svg`)
-- [ ] Block aggregation — collapse repeated layers so deep networks render compactly
+- [x] Block aggregation — collapse repeated layers so deep networks render compactly
 - [ ] Presets for attention/transformer blocks
 - [ ] Styling/theme API
 - [ ] Fallback tracer for data-dependent control flow (`torch.export`)

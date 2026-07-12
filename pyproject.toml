@@ -52,6 +52,7 @@ dev = [
     "mypy>=1.13",
     "pytest>=8.0",
     "ruff>=0.8",
+    "torchvision>=0.28.0",
 ]
 
 # CI and Linux dev boxes get CPU-only torch wheels (~200 MB instead of multi-GB

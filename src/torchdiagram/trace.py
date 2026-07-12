@@ -68,10 +68,15 @@ def _to_ir(fx_node: torch.fx.Node, graph_module: torch.fx.GraphModule) -> Node |
         The corresponding IR node, or ``None`` for ``get_attr`` nodes (parameter/buffer plumbing).
     """
     shape = _output_shape(fx_node)
+    scope, scope_class = _scope(fx_node)
     if fx_node.op == "placeholder":
-        return Node(id=fx_node.name, op="input", label="input", output_shape=shape)
+        return Node(
+            id=fx_node.name, op="input", label="input", output_shape=shape, scope=scope, scope_class=scope_class
+        )
     if fx_node.op == "output":
-        return Node(id=fx_node.name, op="output", label="output", output_shape=shape)
+        return Node(
+            id=fx_node.name, op="output", label="output", output_shape=shape, scope=scope, scope_class=scope_class
+        )
     if fx_node.op == "call_module":
         module = graph_module.get_submodule(str(fx_node.target))
         kind = type(module).__name__
@@ -82,13 +87,15 @@ def _to_ir(fx_node: torch.fx.Node, graph_module: torch.fx.GraphModule) -> Node |
             label=kind,
             params={"config": extra} if extra else {},
             output_shape=shape,
+            scope=scope,
+            scope_class=scope_class,
         )
     if fx_node.op == "call_function":
         label = getattr(fx_node.target, "__name__", str(fx_node.target))
-        return Node(id=fx_node.name, op=label, label=label, output_shape=shape)
+        return Node(id=fx_node.name, op=label, label=label, output_shape=shape, scope=scope, scope_class=scope_class)
     if fx_node.op == "call_method":
         label = str(fx_node.target)
-        return Node(id=fx_node.name, op=label, label=label, output_shape=shape)
+        return Node(id=fx_node.name, op=label, label=label, output_shape=shape, scope=scope, scope_class=scope_class)
     return None  # get_attr: parameter/buffer plumbing, not a diagram block
 
 
@@ -97,3 +104,21 @@ def _output_shape(fx_node: torch.fx.Node) -> tuple[int, ...] | None:
     meta = fx_node.meta.get("tensor_meta")
     shape = getattr(meta, "shape", None)
     return tuple(shape) if shape is not None else None
+
+
+def _scope(fx_node: torch.fx.Node) -> tuple[str | None, str | None]:
+    """Resolve the immediate custom-container ancestor of ``fx_node``, or ``(None, None)``.
+
+    Reads ``nn_module_stack``, which fx populates for every node kind (not just ``call_module``), so functional ops
+    called from inside a submodule's ``forward()`` (e.g. a residual ``add``) still resolve to that submodule.
+    """
+    stack = fx_node.meta.get("nn_module_stack")
+    if not stack:
+        return None, None
+    entries = list(stack.items())
+    if fx_node.op == "call_module":
+        entries = entries[:-1]  # drop the node's own leaf module, keep its parent
+    if not entries:
+        return None, None
+    path, cls = entries[-1][1]
+    return path, cls.__name__

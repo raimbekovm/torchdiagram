@@ -60,6 +60,12 @@ def test_tikz_escapes_special_characters():
     assert r"\%" in tikz
 
 
+def test_tikz_escapes_multiplication_sign():
+    """The '×' character used in aggregated-block labels renders as a math-mode LaTeX command."""
+    graph = td.Graph(nodes=[td.Node(id="a", op="block", label="BasicBlock ×4")])
+    assert r"BasicBlock $\times$4" in td.to_tikz(graph)
+
+
 def test_render_dispatches_on_extension(tmp_path):
     """Render() picks the format from the output file extension."""
     svg_path = td.render(demo_graph(), tmp_path / "model.svg")

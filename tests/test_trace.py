@@ -3,7 +3,7 @@
 import torch
 
 import torchdiagram as td
-from tests.models import ResidualBlock, TinyCNN
+from tests.models import RepeatedBlockStack, ResidualBlock, TinyCNN
 
 
 def test_trace_produces_valid_graph_with_io_nodes():
@@ -50,3 +50,14 @@ def test_graph_name_defaults_to_class_name():
     """Graph name defaults to the model class name and honors an override."""
     assert td.trace(TinyCNN()).name == "TinyCNN"
     assert td.trace(TinyCNN(), name="custom").name == "custom"
+
+
+def test_trace_records_scope_for_nested_submodules():
+    """Nodes traced from inside a custom submodule carry its dotted path and class name."""
+    graph = td.trace(RepeatedBlockStack(2))
+    nested = next(node for node in graph.nodes if node.id == "layer1_0_conv1")
+    assert nested.scope == "layer1.0"
+    assert nested.scope_class == "BasicBlock"
+    root = next(node for node in graph.nodes if node.id == "stem")
+    assert root.scope is None
+    assert root.scope_class is None
