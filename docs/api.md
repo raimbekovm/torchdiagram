@@ -3,7 +3,10 @@
 All public names are importable from the top-level package:
 
 ```python
+import torchdiagram as td
 
+graph = td.trace(model)
+td.render(graph, "model.svg")
 ```
 
 ## Functions
