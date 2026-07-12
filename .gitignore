@@ -8,3 +8,16 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Tool caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+
+# Internal notes, not part of the public docs
+docs/research.md
