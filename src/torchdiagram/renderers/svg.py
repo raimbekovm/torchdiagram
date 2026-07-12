@@ -79,8 +79,7 @@ def to_svg(graph: Graph) -> str:
 
     for i, node in enumerate(graph.nodes):
         y = y_top(i)
-        io = node.op in ("input", "output")
-        fill, stroke = (_IO_FILL, _IO_STROKE) if io else (_BLOCK_FILL, _BLOCK_STROKE)
+        fill, stroke = (_IO_FILL, _IO_STROKE) if node.is_io else (_BLOCK_FILL, _BLOCK_STROKE)
         parts.append(
             f'<rect x="{_PAD}" y="{y}" width="{box_w}" height="{box_h}" rx="6" '
             f'fill="{fill}" stroke="{stroke}" stroke-width="1.2"/>'

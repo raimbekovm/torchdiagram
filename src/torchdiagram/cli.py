@@ -19,6 +19,10 @@ def main(argv: list[str] | None = None) -> None:
 
     Args:
         argv: Command-line arguments to parse, excluding the program name. Defaults to ``sys.argv[1:]`` when ``None``.
+
+    Raises:
+        SystemExit: If the model cannot be loaded, ``--input-shape`` is invalid, tracing fails (e.g. due to
+            data-dependent control flow), or the output path has an unsupported extension.
     """
     parser = argparse.ArgumentParser(
         prog="torchdiagram",
@@ -37,12 +41,37 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     model = _load_model(args.model)
-    example = None
-    if args.input_shape:
-        shape = tuple(int(dim.strip()) for dim in args.input_shape.split(","))
-        example = torch.randn(*shape)
-    path = render(trace(model, example), args.output)
+    example = _build_example_input(args.input_shape)
+    try:
+        graph = trace(model, example)
+    except torch.fx.proxy.TraceError as exc:
+        raise SystemExit(f"error: cannot trace {args.model!r}: {exc}") from exc
+    try:
+        path = render(graph, args.output)
+    except ValueError as exc:
+        raise SystemExit(f"error: {exc}") from exc
     print(f"wrote {path}")
+
+
+def _build_example_input(input_shape: str | None) -> torch.Tensor | None:
+    """Parse ``--input-shape`` into an example tensor for shape propagation.
+
+    Args:
+        input_shape: Comma-separated dimensions, e.g. ``"1,3,224,224"``, or ``None`` to skip shape annotation.
+
+    Returns:
+        A randomly initialized tensor of the requested shape, or ``None`` if ``input_shape`` is ``None``.
+
+    Raises:
+        SystemExit: If ``input_shape`` is not a comma-separated list of integers, or any dimension is invalid.
+    """
+    if not input_shape:
+        return None
+    try:
+        shape = tuple(int(dim.strip()) for dim in input_shape.split(","))
+        return torch.randn(*shape)
+    except (ValueError, RuntimeError) as exc:
+        raise SystemExit(f"error: invalid --input-shape {input_shape!r}: {exc}") from exc
 
 
 def _load_model(spec: str) -> nn.Module:
@@ -74,7 +103,10 @@ def _load_model(spec: str) -> nn.Module:
     if isinstance(obj, nn.Module):
         return obj
     if callable(obj):
-        instance = obj()
+        try:
+            instance = obj()
+        except Exception as exc:
+            raise SystemExit(f"error: {spec!r} could not be called with no arguments: {exc}") from exc
         if isinstance(instance, nn.Module):
             return instance
     raise SystemExit(f"error: {spec!r} is not an nn.Module, an nn.Module subclass, or a factory returning one")

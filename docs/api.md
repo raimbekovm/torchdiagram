@@ -72,6 +72,8 @@ A single block in the diagram: a layer, a function call, or a graph input/output
 
 `op` values produced by the tracer: `"input"` and `"output"` for graph boundaries, the lowercased class name for submodule calls (`"conv2d"`, `"linear"`, `"maxpool2d"`, ...), and the function or method name for functional ops (`"relu"`, `"add"`, `"flatten"`, `"view"`, ...).
 
+**`Node.is_io -> bool`** — `True` for graph input/output nodes (`op` is `"input"` or `"output"`); both renderers use it to pick the distinct I/O box style.
+
 ### `td.Edge`
 
 A directed data-flow edge between two nodes.

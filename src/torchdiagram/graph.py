@@ -29,6 +29,11 @@ class Node:
     params: dict[str, Any] = field(default_factory=dict)
     output_shape: tuple[int, ...] | None = None
 
+    @property
+    def is_io(self) -> bool:
+        """Whether this node is a graph input or output, rendered in a distinct style."""
+        return self.op in ("input", "output")
+
 
 @dataclass
 class Edge:

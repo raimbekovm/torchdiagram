@@ -36,7 +36,7 @@ def to_tikz(graph: Graph) -> str:
 
     previous = None
     for node in graph.nodes:
-        style = "io" if node.op in ("input", "output") else "block"
+        style = "io" if node.is_io else "block"
         placement = f", below=of {previous}" if previous else ""
         lines.append(rf"\node[{style}{placement}] ({node.id}) {{{_node_text(node)}}};")
         previous = node.id

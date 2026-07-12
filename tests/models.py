@@ -33,3 +33,26 @@ class ResidualBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply conv-relu-conv, add the residual, and activate."""
         return F.relu(self.conv2(F.relu(self.conv1(x))) + x)
+
+
+class BranchingModel(nn.Module):
+    """Branches on a runtime tensor value — not fx-traceable, exercises the CLI's tracing-error path."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return ``x`` or ``-x`` depending on a data-dependent condition."""
+        if x.sum() > 0:
+            return x
+        return -x
+
+
+class NeedsConstructorArgs(nn.Module):
+    """Requires a constructor argument — exercises the CLI's zero-argument-factory error path."""
+
+    def __init__(self, num_classes: int) -> None:
+        """Initialize a linear classifier head with ``num_classes`` outputs."""
+        super().__init__()
+        self.fc = nn.Linear(4, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the linear classifier."""
+        return self.fc(x)
