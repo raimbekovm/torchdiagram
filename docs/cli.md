@@ -1,0 +1,50 @@
+# CLI reference
+
+The `torchdiagram` command traces a model given by an import path and writes a rendered diagram.
+
+## Synopsis
+
+```bash
+torchdiagram MODEL -o OUTPUT [--input-shape SHAPE]
+```
+
+## Arguments
+
+| Argument         | Required | Description                                                                                      |
+| ---------------- | -------- | ------------------------------------------------------------------------------------------------ |
+| `MODEL`          | yes      | Import path to the model in the form `package.module:attr`.                                      |
+| `-o`, `--output` | yes      | Output file. The format is selected by extension: `.svg`, `.tex`, or `.tikz`.                    |
+| `--input-shape`  | no       | Comma-separated input shape, e.g. `1,3,224,224`. Enables output-shape annotations on every node. |
+
+## Model specification
+
+The `MODEL` argument names a module and an attribute inside it, separated by a colon. The attribute may be:
+
+- an `nn.Module` **instance** (`my_models:net`),
+- an `nn.Module` **subclass**, which is instantiated with no arguments (`my_models:ResidualBlock`),
+- a **zero-argument factory function** returning an `nn.Module` (`my_models:build_model`).
+
+The current working directory is added to the import path, so a model defined in `./my_models.py` is addressable as `my_models:...` without installing anything. Installed packages work the same way (`torchvision.models:resnet18`).
+
+Models that require constructor arguments cannot be instantiated by the CLI; wrap them in a zero-argument factory function, or use the [Python API](api.md).
+
+## Input shape
+
+When `--input-shape` is given, the CLI creates a random float tensor of that shape with `torch.randn` and uses it for shape propagation. For models that expect non-float inputs (for example, token indices for an embedding layer), use the Python API and pass an appropriate `example_input` to `trace()`.
+
+## Examples
+
+```bash
+# Structure-only SVG from a class in the current directory
+torchdiagram my_models:ResidualBlock -o block.svg
+
+# Shape-annotated diagram
+torchdiagram my_models:ResidualBlock -o block.svg --input-shape 1,64,56,56
+
+# Standalone TikZ document from an installed package
+torchdiagram torchvision.models:resnet18 -o resnet18.tex --input-shape 1,3,224,224
+```
+
+## Exit behavior
+
+On success, the command prints the path of the written file and exits with status 0. Import failures, invalid model specifications, and unsupported output extensions terminate with a non-zero status and an error message on stderr.
