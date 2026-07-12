@@ -1,0 +1,17 @@
+[project]
+name = "torchdiagram"
+version = "0.1.0"
+description = "Generate publication-ready architecture diagrams directly from PyTorch model code"
+readme = "README.md"
+authors = [
+    { name = "Murat Raimbekov", email = "raimbekov_m@auca.kg" }
+]
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+torchdiagram = "torchdiagram:main"
+
+[build-system]
+requires = ["uv_build>=0.11.28,<0.12.0"]
+build-backend = "uv_build"
