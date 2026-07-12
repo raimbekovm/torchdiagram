@@ -1,7 +1,7 @@
 [project]
 name = "torchdiagram"
 version = "0.1.0"
-description = "Publication-ready neural-network architecture diagrams straight from PyTorch code"
+description = "PyTorch architecture diagram generator — neural network diagram, model visualization as SVG or TikZ/LaTeX"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -16,8 +16,12 @@ keywords = [
     "pytorch",
     "neural-network",
     "architecture-diagram",
+    "model-visualization",
     "visualization",
+    "diagram-generator",
+    "deep-learning",
     "tikz",
+    "latex",
     "svg",
     "torch-fx",
 ]
