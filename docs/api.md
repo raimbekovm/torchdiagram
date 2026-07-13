@@ -36,14 +36,14 @@ Returns the written path. Raises `ValueError` for an unsupported extension or an
 
 ### `td.aggregate_blocks(graph, *, min_repeats=2) -> Graph`
 
-Collapse runs of repeated, structurally identical blocks (e.g. ResNet layers) into a single labeled node.
+Collapse scoped blocks — repeated ones (e.g. ResNet layers) and singleton ones (e.g. a transformer's attention or MLP sub-block) — into single labeled nodes, recursively from the deepest nesting outward.
 
-| Parameter     | Type    | Description                                                             |
-| ------------- | ------- | ----------------------------------------------------------------------- |
-| `graph`       | `Graph` | Graph to transform. Not mutated.                                        |
-| `min_repeats` | `int`   | Minimum run length, in groups, required to collapse a run. Default `2`. |
+| Parameter     | Type    | Description                                                                                         |
+| ------------- | ------- | --------------------------------------------------------------------------------------------------- |
+| `graph`       | `Graph` | Graph to transform. Not mutated.                                                                    |
+| `min_repeats` | `int`   | Minimum run length, in groups, required to merge multiple groups into one badged node. Default `2`. |
 
-Groups nodes by the module scope they were traced from (see `Node.scope`), then merges consecutive groups that share a `scope_class` and an identical internal structure into one synthetic node with `op="block"`, `label` like `"BasicBlock ×5"`, and `params={"repeats": ..., "block_class": ..., "ops_per_repeat": ...}`. Groups that aren't single-entry/single-exit, or whose structure differs from their neighbors, are left untouched — a stage's non-uniform first block (e.g. a downsample variant) stays expanded rather than being merged incorrectly. Pure function; returns a new, validated graph. See [aggregating repeated blocks](usage.md#aggregating-repeated-blocks).
+Groups nodes by the module scope they were traced from (see `Node.scope`), processing the deepest scope nesting first. A group that's single-entry/single-exit always collapses into one synthetic node with `op="block"` and `params={"repeats": ..., "block_class": ..., "ops_per_repeat": ...}` — even if it occurs only once, e.g. an attention or MLP block that appears exactly once per transformer layer, in which case `label` is just the class name (`"Attention"`) with `repeats=1`. Consecutive groups that additionally share a `scope_class` and an identical internal structure are merged into a single node instead, labeled e.g. `"BasicBlock ×5"`, provided the run has at least `min_repeats` groups; shorter runs still collapse, just one node per group. Groups that aren't single-entry/single-exit are left untouched — a branch whose output is tapped elsewhere stays expanded rather than being merged incorrectly. Because collapsing runs deepest-first, a repeated outer block (e.g. a transformer block containing a singleton attention and MLP) is compared against its siblings using its own short, already-collapsed node sequence, which is what lets it merge into `"TransformerBlock ×N"` even though its inner sub-blocks are not themselves repeated. Pure function; returns a new, validated graph. See [aggregating repeated blocks](usage.md#aggregating-repeated-blocks).
 
 ### `td.to_svg(graph) -> str`
 

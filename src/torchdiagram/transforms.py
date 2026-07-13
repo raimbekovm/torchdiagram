@@ -21,30 +21,64 @@ class _Group:
 
 
 def aggregate_blocks(graph: Graph, *, min_repeats: int = 2) -> Graph:
-    """Collapse runs of repeated, structurally identical blocks into a single labeled node.
+    """Collapse scoped blocks into single labeled nodes, recursively from the deepest nesting outward.
 
-    Nodes are grouped by the ``scope`` module they were traced from (see :func:`torchdiagram.trace.trace`). Consecutive
-    groups that share a ``scope_class`` and an identical internal structure — same op sequence, same internal edge
-    topology, same external-entry positions — are merged into one synthetic ``"block"`` node labeled e.g. ``"BasicBlock
-    ×5"``. A group is only eligible to merge if it has a single external entry point and its only external exit
-    originates from its last node; groups that fail this check, or whose structure differs from their neighbors, are
-    left untouched. Nodes with no scope (``scope is None``) are never grouped.
+    Nodes are grouped by the ``scope`` module they were traced from (see :func:`torchdiagram.trace.trace`). A group that
+    has a single external entry point and whose only external exit originates from its last node (see :func:`_eligible`)
+    always collapses into one synthetic ``"block"`` node — even if it occurs only once, e.g. an attention or MLP block
+    that appears exactly once per transformer layer. Consecutive groups that additionally share a ``scope_class`` and an
+    identical internal structure — same op sequence, same internal edge topology, same external-entry positions — are
+    merged into a single node labeled e.g. ``"BasicBlock ×5"`` instead of one node per group, provided the run has at
+    least ``min_repeats`` groups; shorter runs still collapse, just one node per group, unbadged. Nodes with no scope
+    (``scope is None``) are never grouped, and groups that fail the eligibility check are left fully expanded.
+
+    Collapsing runs deepest-scope-first means an outer scope (e.g. a transformer block containing an attention and an
+    MLP sub-block) only needs to compare its own short, already-collapsed node sequence against its siblings, rather
+    than the full expanded internals — which is what lets a repeated transformer block collapse to ``"Block ×N"`` even
+    though its inner attention/MLP blocks are not themselves repeated.
 
     Args:
         graph: Graph to transform. Not mutated.
-        min_repeats: Minimum run length, in groups, required to collapse a run.
+        min_repeats: Minimum run length, in groups, required to merge multiple groups into one badged node; below this,
+            each eligible group still collapses, just individually.
 
     Returns:
-        A new, validated graph with eligible runs collapsed; everything else is copied through unchanged, in
-        its original order.
+        A new, validated graph with eligible scopes collapsed; everything else is copied through unchanged,
+        in its original order.
     """
+    nodes, edges = list(graph.nodes), list(graph.edges)
+    max_depth = max((_depth(node.scope) for node in nodes if node.scope is not None), default=0)
+    for depth in range(max_depth, 0, -1):
+        nodes, edges = _aggregate_one_level(nodes, edges, depth, min_repeats)
+
+    result = Graph(name=graph.name, nodes=nodes, edges=edges)
+    result.validate()
+    return result
+
+
+def _depth(scope: str) -> int:
+    """Nesting depth of a dotted scope path, e.g. ``"blocks.0.attn"`` is depth 3."""
+    return scope.count(".") + 1
+
+
+def _parent_scope(scope: str) -> str | None:
+    """The dotted scope path one level up from ``scope``, or ``None`` if ``scope`` is already top-level."""
+    parent, _, _ = scope.rpartition(".")
+    return parent or None
+
+
+def _aggregate_one_level(
+    nodes: list[Node], edges: list[Edge], target_depth: int, min_repeats: int
+) -> tuple[list[Node], list[Edge]]:
+    """Collapse eligible scope groups at exactly ``target_depth``, leaving other depths untouched."""
     incoming: dict[str, list[Edge]] = {}
     outgoing: dict[str, list[Edge]] = {}
-    for edge in graph.edges:
+    for edge in edges:
         incoming.setdefault(edge.target, []).append(edge)
         outgoing.setdefault(edge.source, []).append(edge)
 
-    segments = _segment_by_scope(graph.nodes)
+    path_class = {node.scope: node.scope_class for node in nodes if node.scope is not None}
+    segments = _segment_by_scope(nodes, target_depth)
     items = _merge_runs(segments, incoming, outgoing)
 
     new_nodes: list[Node] = []
@@ -52,37 +86,40 @@ def aggregate_blocks(graph: Graph, *, min_repeats: int = 2) -> Graph:
     for item in items:
         if isinstance(item, Node):
             new_nodes.append(item)
-        elif len(item) >= min_repeats:
-            synthetic = _synthesize(item)
-            new_nodes.append(synthetic)
-            for group in item:
-                for node in group.nodes:
-                    collapsed[node.id] = synthetic.id
-        else:
+            continue
+        if not _eligible(item[0], incoming, outgoing):
             for group in item:
                 new_nodes.extend(group.nodes)
+            continue
+        runs = [item] if len(item) >= min_repeats else [[group] for group in item]
+        for run in runs:
+            synthetic = _synthesize(run)
+            parent = _parent_scope(run[0].scope)
+            synthetic.scope = parent
+            synthetic.scope_class = path_class.get(parent) if parent is not None else None
+            new_nodes.append(synthetic)
+            for group in run:
+                for node in group.nodes:
+                    collapsed[node.id] = synthetic.id
 
     new_edges: list[Edge] = []
     seen: set[tuple[str, str]] = set()
-    for edge in graph.edges:
+    for edge in edges:
         source = collapsed.get(edge.source, edge.source)
         target = collapsed.get(edge.target, edge.target)
         if source == target or (source, target) in seen:
             continue
         seen.add((source, target))
         new_edges.append(Edge(source=source, target=target))
-
-    result = Graph(name=graph.name, nodes=new_nodes, edges=new_edges)
-    result.validate()
-    return result
+    return new_nodes, new_edges
 
 
-def _segment_by_scope(nodes: list[Node]) -> list[Node | _Group]:
-    """Partition ``nodes`` into scope-less nodes and maximal same-scope groups, in order."""
+def _segment_by_scope(nodes: list[Node], target_depth: int) -> list[Node | _Group]:
+    """Partition ``nodes`` into non-groupable nodes and maximal same-scope groups at ``target_depth``."""
     segments: list[Node | _Group] = []
     current: _Group | None = None
     for node in nodes:
-        has_scope = node.scope is not None and node.scope_class is not None
+        has_scope = node.scope is not None and node.scope_class is not None and _depth(node.scope) == target_depth
         if has_scope and current is not None and current.scope == node.scope:
             current.nodes.append(node)
             continue
@@ -146,6 +183,13 @@ def _eligible(group: _Group, incoming: dict[str, list[Edge]], outgoing: dict[str
     return all(edge.source == last_id for edge in exit_edges)
 
 
+def _op_key(node: Node) -> str:
+    """Signature key for a node's operation: disambiguates synthetic ``"block"`` nodes by what they collapsed."""
+    if node.op == "block":
+        return f"block:{node.params.get('block_class')}"
+    return node.op
+
+
 def _signature(
     group: _Group, incoming: dict[str, list[Edge]], outgoing: dict[str, list[Edge]]
 ) -> tuple[tuple[str, ...], tuple[tuple[int, ...], ...], tuple[bool, ...]]:
@@ -153,7 +197,7 @@ def _signature(
     ids = [node.id for node in group.nodes]
     id_set = set(ids)
     index = {node_id: i for i, node_id in enumerate(ids)}
-    ops = tuple(node.op for node in group.nodes)
+    ops = tuple(_op_key(node) for node in group.nodes)
     topology = []
     external_entry = []
     for i, node_id in enumerate(ids):
@@ -168,10 +212,11 @@ def _synthesize(run: list[_Group]) -> Node:
     """Build the single synthetic node that replaces a collapsed run of matching groups."""
     first, last = run[0], run[-1]
     repeats = len(run)
+    label = first.scope_class if repeats == 1 else f"{first.scope_class} ×{repeats}"
     return Node(
         id=f"{first.nodes[0].id}__agg",
         op="block",
-        label=f"{first.scope_class} ×{repeats}",
+        label=label,
         params={"repeats": repeats, "block_class": first.scope_class, "ops_per_repeat": len(first.nodes)},
         output_shape=last.nodes[-1].output_shape,
     )

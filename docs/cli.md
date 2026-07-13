@@ -10,13 +10,13 @@ torchdiagram MODEL -o OUTPUT [--input-shape SHAPE] [--aggregate] [--min-repeats 
 
 ## Arguments
 
-| Argument         | Required | Description                                                                                                  |
-| ---------------- | -------- | ------------------------------------------------------------------------------------------------------------ |
-| `MODEL`          | yes      | Import path to the model in the form `package.module:attr`.                                                  |
-| `-o`, `--output` | yes      | Output file. The format is selected by extension: `.svg`, `.tex`, or `.tikz`.                                |
-| `--input-shape`  | no       | Comma-separated input shape, e.g. `1,3,224,224`. Enables output-shape annotations on every node.             |
-| `--aggregate`    | no       | Collapse runs of repeated, structurally identical blocks (e.g. ResNet layers) into one node. Off by default. |
-| `--min-repeats`  | no       | Minimum run length required to collapse with `--aggregate` (default: `2`).                                   |
+| Argument         | Required | Description                                                                                                                                                      |
+| ---------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MODEL`          | yes      | Import path to the model in the form `package.module:attr`.                                                                                                      |
+| `-o`, `--output` | yes      | Output file. The format is selected by extension: `.svg`, `.tex`, or `.tikz`.                                                                                    |
+| `--input-shape`  | no       | Comma-separated input shape, e.g. `1,3,224,224`. Enables output-shape annotations on every node.                                                                 |
+| `--aggregate`    | no       | Collapse scoped blocks — repeated (e.g. ResNet layers) and singleton (e.g. a transformer's attention/MLP sub-block) — into single labeled nodes. Off by default. |
+| `--min-repeats`  | no       | Minimum run length required to merge multiple blocks into one badged node with `--aggregate` (default: `2`); shorter runs still collapse individually.           |
 
 ## Model specification
 

@@ -94,6 +94,73 @@ class NonUniformBlockStack(nn.Module):
         return self.layer1(self.stem(x))
 
 
+class Attention(nn.Module):
+    """Multi-head self-attention written out by hand — qkv projection, softmax, no fused kernel or leaf module."""
+
+    def __init__(self, dim: int, heads: int = 4) -> None:
+        """Initialize the qkv and output projections."""
+        super().__init__()
+        self.heads = heads
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Split into heads, attend, merge heads, and project."""
+        b, n, c = x.shape
+        qkv = self.qkv(x).reshape(b, n, 3, self.heads, c // self.heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn = (q @ k.transpose(-2, -1)).softmax(dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(b, n, c)
+        return self.proj(out)
+
+
+class MLP(nn.Module):
+    """Two-layer feed-forward block with a GELU activation."""
+
+    def __init__(self, dim: int, hidden: int) -> None:
+        """Initialize the two linear layers."""
+        super().__init__()
+        self.fc1 = nn.Linear(dim, hidden)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply fc1-GELU-fc2."""
+        return self.fc2(self.act(self.fc1(x)))
+
+
+class TransformerBlock(nn.Module):
+    """Pre-norm attention + MLP block with residual connections, the repeatable unit for transformer stacks."""
+
+    def __init__(self, dim: int, heads: int) -> None:
+        """Initialize the norms and the attention and MLP sub-modules."""
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = Attention(dim, heads)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = MLP(dim, dim * 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply attention and MLP, each with a pre-norm and a residual add."""
+        x = x + self.attn(self.norm1(x))
+        return x + self.mlp(self.norm2(x))
+
+
+class TransformerStack(nn.Module):
+    """A stack of identical ``TransformerBlock`` instances — the repeatable unit for nested block-aggregation tests."""
+
+    def __init__(self, num_blocks: int = 4, dim: int = 32, heads: int = 4) -> None:
+        """Initialize the stack of transformer blocks."""
+        super().__init__()
+        self.blocks = nn.ModuleList([TransformerBlock(dim, heads) for _ in range(num_blocks)])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply each block in sequence."""
+        for block in self.blocks:
+            x = block(x)
+        return x
+
+
 class BranchingModel(nn.Module):
     """Branches on a runtime tensor value — not fx-traceable, exercises the CLI's tracing-error path."""
 

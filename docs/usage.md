@@ -51,7 +51,9 @@ Models that are fully defined in terms of submodule calls, tensor functions, and
 
 ### Aggregating repeated blocks
 
-Deep models trace to hundreds of nodes — a ResNet-50 is 177. `aggregate_blocks()` collapses runs of repeated, structurally identical blocks into a single labeled node before rendering:
+Deep models trace to hundreds of nodes — a ResNet-50 is 177, and every transformer block adds dozens more for
+its attention math alone. `aggregate_blocks()` collapses scoped blocks into single labeled nodes before
+rendering, recursing from the deepest nesting outward:
 
 ```python
 graph = td.trace(model, example_input)
@@ -59,14 +61,30 @@ graph = td.aggregate_blocks(graph)
 td.render(graph, "model.svg")
 ```
 
-It groups nodes by the submodule they were traced from (`Node.scope`/`scope_class`, set by `trace()`), then merges consecutive groups that share the same class and internal structure into one node — `op="block"`, `label` like `"BasicBlock ×5"`, and `params={"repeats": 5, "block_class": "BasicBlock", "ops_per_repeat": 5}`.
+It groups nodes by the submodule they were traced from (`Node.scope`/`scope_class`, set by `trace()`). A
+group that's structurally clean (single entry, single exit) always collapses to one node — `op="block"`,
+`params={"repeats": ..., "block_class": ..., "ops_per_repeat": ...}` — even if it only occurs once, so a
+transformer's attention or MLP sub-block collapses to a plain `"Attention"`/`"MLP"` node the same way a
+repeated ResNet block does. Consecutive groups that additionally share a class and internal structure merge
+into a single node instead, labeled e.g. `"BasicBlock ×5"`. Because the deepest scopes collapse first, a
+transformer block's own node sequence becomes short and uniform once its attention/MLP contents are
+collapsed, which is what lets the stack of blocks itself then merge into one `"TransformerBlock ×N"` node —
+no attention-specific code involved, just the same scope+structure rule applied one nesting level at a time.
+This outer merge relies on the block having at least one op of its own at that scope (a residual `add` is the
+common case); a container that does nothing but call its children collapses its contents fine but won't merge
+across repeats itself — see [design.md](design.md#block-aggregation).
 
-Only exact structural matches merge. A stage whose first block differs from the rest — for example a ResNet stage's first `Bottleneck`, which has an extra downsample convolution on the shortcut — stays expanded as individual nodes; the remaining uniform blocks collapse into one. This is expected, not a bug: it keeps the diagram from misrepresenting a block that isn't actually identical to its neighbors.
+Only exact structural matches merge. A stage whose first block differs from the rest — for example a ResNet
+stage's first `Bottleneck`, which has an extra downsample convolution on the shortcut — collapses to its own
+single node rather than merging with its neighbors; the remaining uniform blocks merge into one. This is
+expected, not a bug: it keeps the diagram from misrepresenting a block that isn't actually identical to its
+neighbors, while still compacting it to one glyph.
 
-`min_repeats` (default `2`) sets how many consecutive matching blocks are required before they collapse:
+`min_repeats` (default `2`) sets how many consecutive matching blocks are required before they merge into one
+badged node; below that, each still collapses individually, just without the `×N` badge:
 
 ```python
-graph = td.aggregate_blocks(graph, min_repeats=3)  # only collapse runs of 3 or more
+graph = td.aggregate_blocks(graph, min_repeats=3)  # only merge runs of 3 or more into one node
 ```
 
 `aggregate_blocks()` is a pure function — it returns a new graph and does not modify its input — and is opt-in: `trace()` and `render()` never call it implicitly.

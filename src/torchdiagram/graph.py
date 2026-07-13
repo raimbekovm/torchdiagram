@@ -23,7 +23,9 @@ class Node:
         output_shape: Output tensor shape, populated when tracing runs with an example input.
         scope: Dotted path of the immediate custom-container module this node was traced from, e.g. ``"layer1.0"``, or
             ``None`` if the node isn't nested in one.
-        scope_class: Class name of that container, e.g. ``"BasicBlock"``, or ``None`` alongside ``scope``.
+        scope_class: Class name of that container, e.g. ``"BasicBlock"``. Normally ``None`` exactly when ``scope`` is,
+            but a synthetic node produced by :func:`torchdiagram.transforms.aggregate_blocks` can carry a non-``None``
+            ``scope`` with ``scope_class=None`` when the parent container's own class name couldn't be resolved.
     """
 
     id: str

@@ -85,7 +85,7 @@ Pre-alpha. The core pipeline works end-to-end:
 - [x] TikZ renderer (standalone compilable document)
 - [x] CLI (`torchdiagram pkg.module:Model -o out.svg`)
 - [x] Block aggregation — collapse repeated layers so deep networks render compactly
-- [ ] Presets for attention/transformer blocks
+- [x] Presets for attention/transformer blocks
 - [ ] Styling/theme API
 - [ ] Fallback tracer for data-dependent control flow (`torch.export`)
 - [ ] PNG export

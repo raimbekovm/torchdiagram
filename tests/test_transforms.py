@@ -3,7 +3,7 @@
 import torch
 
 import torchdiagram as td
-from tests.models import NonUniformBlockStack, RepeatedBlockStack, TinyCNN
+from tests.models import NonUniformBlockStack, RepeatedBlockStack, TinyCNN, TransformerStack
 from torchdiagram.transforms import aggregate_blocks
 
 
@@ -65,12 +65,16 @@ def test_aggregate_is_pure():
 
 
 def test_aggregate_respects_min_repeats():
-    """A run shorter than min_repeats is left uncollapsed."""
+    """Below min_repeats, matching groups still collapse individually — they just don't merge into one ×N node."""
     graph = td.trace(RepeatedBlockStack(2))
-    unchanged = aggregate_blocks(graph, min_repeats=3)
-    assert len(unchanged.nodes) == len(graph.nodes)
-    collapsed = aggregate_blocks(graph, min_repeats=2)
-    assert any(node.op == "block" for node in collapsed.nodes)
+    unmerged = aggregate_blocks(graph, min_repeats=3)
+    blocks = [node for node in unmerged.nodes if node.op == "block"]
+    assert len(blocks) == 2
+    assert all(block.label == "BasicBlock" for block in blocks)
+    merged = aggregate_blocks(graph, min_repeats=2)
+    merged_blocks = [node for node in merged.nodes if node.op == "block"]
+    assert len(merged_blocks) == 1
+    assert merged_blocks[0].label == "BasicBlock ×2"
 
 
 def test_aggregate_leaves_non_repeated_graph_unchanged():
@@ -82,17 +86,72 @@ def test_aggregate_leaves_non_repeated_graph_unchanged():
 
 
 def test_aggregate_partial_match_collapses_only_uniform_suffix():
-    """A stage's non-uniform first block stays individually present; the uniform rest collapses."""
+    """A stage's non-uniform first block collapses to its own node; the uniform rest merges into one ×N node."""
     graph = td.trace(NonUniformBlockStack(3))
     result = aggregate_blocks(graph)
     ops = [node.op for node in result.nodes]
-    assert ops.count("block") == 1
-    assert "downsample" in " ".join(node.id for node in result.nodes if "downsample" in node.id)
-    block = next(node for node in result.nodes if node.op == "block")
-    assert block.label == "BasicBlock ×2"
+    assert ops.count("block") == 2
+    blocks = [node for node in result.nodes if node.op == "block"]
+    singleton = next(block for block in blocks if block.params["repeats"] == 1)
+    merged = next(block for block in blocks if block.params["repeats"] > 1)
+    assert singleton.params["block_class"] == "_DownsampleBlock"
+    assert merged.label == "BasicBlock ×2"
 
 
 def test_aggregate_result_passes_validate():
     """The transform's output is internally consistent."""
     graph = td.trace(RepeatedBlockStack(4))
     aggregate_blocks(graph).validate()  # must not raise
+
+
+def test_aggregate_collapses_nested_transformer_blocks():
+    """Attention/MLP singleton-collapse first; the now-uniform TransformerBlock scope then merges across repeats."""
+    graph = td.trace(TransformerStack(4), torch.randn(1, 4, 32))
+    result = aggregate_blocks(graph)
+    ops = [node.op for node in result.nodes]
+    assert ops == ["input", "block", "output"]
+    block = result.nodes[1]
+    assert block.label == "TransformerBlock ×4"
+    assert block.params["repeats"] == 4
+
+
+def test_aggregate_does_not_merge_blocks_with_different_inner_content():
+    """Two groups with the same op sequence but a different collapsed block inside must not be merged together."""
+    nodes = [
+        td.Node(id="in", op="input", label="input"),
+        td.Node(id="s0_ln", op="layernorm", label="LayerNorm", scope="stage.0", scope_class="Stage"),
+        td.Node(
+            id="s0_blk",
+            op="block",
+            label="Attention",
+            params={"block_class": "Attention"},
+            scope="stage.0",
+            scope_class="Stage",
+        ),
+        td.Node(id="s0_add", op="add", label="add", scope="stage.0", scope_class="Stage"),
+        td.Node(id="s1_ln", op="layernorm", label="LayerNorm", scope="stage.1", scope_class="Stage"),
+        td.Node(
+            id="s1_blk",
+            op="block",
+            label="MLP",
+            params={"block_class": "MLP"},
+            scope="stage.1",
+            scope_class="Stage",
+        ),
+        td.Node(id="s1_add", op="add", label="add", scope="stage.1", scope_class="Stage"),
+        td.Node(id="out", op="output", label="output"),
+    ]
+    edges = [
+        td.Edge("in", "s0_ln"),
+        td.Edge("s0_ln", "s0_blk"),
+        td.Edge("s0_blk", "s0_add"),
+        td.Edge("s0_add", "s1_ln"),
+        td.Edge("s1_ln", "s1_blk"),
+        td.Edge("s1_blk", "s1_add"),
+        td.Edge("s1_add", "out"),
+    ]
+    graph = td.Graph(nodes=nodes, edges=edges)
+    result = aggregate_blocks(graph)
+    blocks = [node for node in result.nodes if node.op == "block"]
+    assert len(blocks) == 2
+    assert all("×" not in block.label for block in blocks)
