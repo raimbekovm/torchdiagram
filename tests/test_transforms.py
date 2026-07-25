@@ -3,7 +3,15 @@
 import torch
 
 import torchdiagram as td
-from tests.models import NonUniformBlockStack, RepeatedBlockStack, TinyCNN, TransformerStack
+from tests.models import (
+    ClassifierHead,
+    MixedDepthStack,
+    NonUniformBlockStack,
+    RepeatedBlockStack,
+    TinyCNN,
+    TransformerStack,
+    WideningStack,
+)
 from torchdiagram.transforms import aggregate_blocks
 
 
@@ -113,6 +121,38 @@ def test_aggregate_collapses_nested_transformer_blocks():
     block = result.nodes[1]
     assert block.label == "TransformerBlock ×4"
     assert block.params["repeats"] == 4
+
+
+def test_aggregate_does_not_merge_stages_of_different_depth():
+    """Two stages whose collapsed contents differ stay separate, however alike they look once collapsed.
+
+    Both stages are a Sequential of convolutions followed by a pool, so once the Sequential becomes one node each stage
+    reads as the same two-node sequence. Only what the Sequential collapsed tells them apart, and a merge here would
+    badge a two-convolution stage and a three-convolution one as the same block repeated.
+    """
+    graph = td.trace(MixedDepthStack(), torch.randn(1, 4, 8, 8))
+    result = aggregate_blocks(graph)
+    blocks = [node for node in result.nodes if node.op == "block"]
+    assert len(blocks) == 2
+    assert all("×" not in block.label for block in blocks)
+
+
+def test_aggregate_does_not_merge_stages_of_different_width():
+    """Identically structured stages running different channel counts are not repeats of each other."""
+    graph = td.trace(WideningStack(), torch.randn(1, 3, 8, 8))
+    result = aggregate_blocks(graph)
+    blocks = [node for node in result.nodes if node.op == "block"]
+    assert len(blocks) == 2
+    assert all(block.params["repeats"] == 1 for block in blocks)
+
+
+def test_aggregate_names_container_blocks_after_their_attribute():
+    """A collapsed ``nn.Sequential`` is labeled with the attribute holding it, not with the container's class name."""
+    graph = td.trace(ClassifierHead(), torch.randn(1, 3, 8, 8))
+    result = aggregate_blocks(graph)
+    labels = [node.label for node in result.nodes]
+    assert "classifier" in labels
+    assert "Sequential" not in labels
 
 
 def test_aggregate_does_not_merge_blocks_with_different_inner_content():

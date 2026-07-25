@@ -12,6 +12,24 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+def scope_leaf(path: str) -> str:
+    """The attribute name at the end of a dotted module path, e.g. ``"features.3.conv"`` gives ``"conv"``.
+
+    A numeric leaf is a list index rather than a name — ``nn.Sequential`` and ``nn.ModuleList`` children are ``"0"``,
+    ``"1"``, and so on — so the segment above it is kept alongside, giving ``"blocks.0"`` rather than a bare ``"0"``.
+
+    Args:
+        path: Dotted submodule path, as recorded in :attr:`Node.scope`.
+
+    Returns:
+        The readable tail of the path.
+    """
+    head, _, leaf = path.rpartition(".")
+    if leaf.isdigit() and head:
+        return f"{head.rpartition('.')[2]}.{leaf}"
+    return leaf
+
+
 @dataclass
 class Node:
     """A single block in the diagram: a layer, a function call, or a graph input/output.

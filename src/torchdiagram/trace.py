@@ -16,10 +16,20 @@ from torch import nn
 from torch.fx.passes.shape_prop import ShapeProp
 
 from .export_trace import trace_export
-from .graph import Edge, Graph, Node
+from .frontend import build_edges, qualify_labels
+from .graph import Graph, Node
 
 BACKENDS = ("auto", "fx", "export")
 """Accepted values for the ``backend`` argument, shared with the CLI's ``--backend`` choices."""
+
+# Tensor attributes and methods that report metadata rather than data. Reading one starts a computation about the
+# tensor (`x.shape[1]`, `x.size(0) // heads`) that the model needs but a diagram of the architecture does not.
+_METADATA_ATTRS = frozenset({"shape", "dtype", "device", "ndim", "requires_grad", "is_cuda", "is_leaf"})
+_METADATA_METHODS = frozenset({"size", "dim", "numel", "item", "element_size", "stride", "get_device"})
+
+# Plain Python arithmetic and indexing, the only operations metadata is allowed to spread through. A torch function
+# fed a shape (`torch.arange(n)`, `x.view(b, -1)`) produces a tensor again and stays in the diagram.
+_SCALAR_MODULES = frozenset({"builtins", "operator", "_operator"})
 
 
 def trace(
@@ -94,19 +104,62 @@ def _trace_fx(model: nn.Module, example_input: torch.Tensor | None, *, name: str
         ShapeProp(graph_module).propagate(example_input)
 
     graph = Graph(name=name or type(model).__name__)
-    kept: dict[torch.fx.Node, str] = {}
+    owner: dict[torch.fx.Node, str] = {}
+    paths: dict[str, str] = {}
+    plumbing = _plumbing(graph_module)
     for fx_node in graph_module.graph.nodes:
+        if fx_node in plumbing:
+            continue
         node = _to_ir(fx_node, graph_module)
         if node is None:
             continue
-        kept[fx_node] = node.id
+        if fx_node.op == "call_module":
+            paths[node.id] = str(fx_node.target)
+        owner[fx_node] = node.id
         graph.nodes.append(node)
 
-    for fx_node, target_id in kept.items():
-        for upstream in fx_node.all_input_nodes:
-            if upstream in kept:
-                graph.edges.append(Edge(source=kept[upstream], target=target_id))
+    qualify_labels(graph.nodes, paths)
+    graph.edges = build_edges(owner)
     return graph
+
+
+def _plumbing(graph_module: torch.fx.GraphModule) -> set[torch.fx.Node]:
+    """Collect the nodes that compute with a tensor's metadata rather than with the tensor.
+
+    ``x.shape[1]`` traces as a ``getattr`` feeding a ``getitem``, and an attention head's ``c // self.heads`` adds a
+    ``floordiv`` on top. None of them is a layer, none carries a shape to annotate, and together they leave a diagram
+    with a row of boxes reading ``getattr``, ``getitem``, ``getattr``. The ``torch.export`` frontend already drops their
+    equivalents, so keeping them here would also break the promise that both frontends emit the same IR.
+
+    A torch call that consumes a shape is not plumbing: ``torch.arange(idx.shape[1])`` produces a real tensor and is
+    part of the model, so only plain Python arithmetic and indexing propagate the classification.
+
+    Args:
+        graph_module: The traced graph module.
+
+    Returns:
+        The nodes to leave out of the diagram.
+    """
+    plumbing: set[torch.fx.Node] = set()
+    for fx_node in graph_module.graph.nodes:  # forward order, so a producer is classified before its consumers
+        if _reads_metadata(fx_node) or _computes_on(plumbing, fx_node):
+            plumbing.add(fx_node)
+    return plumbing
+
+
+def _reads_metadata(fx_node: torch.fx.Node) -> bool:
+    """Whether ``fx_node`` asks a tensor about itself, e.g. ``x.shape`` or ``x.size(0)``."""
+    if fx_node.op == "call_function" and fx_node.target is getattr:
+        return len(fx_node.args) > 1 and fx_node.args[1] in _METADATA_ATTRS
+    return fx_node.op == "call_method" and str(fx_node.target) in _METADATA_METHODS
+
+
+def _computes_on(plumbing: set[torch.fx.Node], fx_node: torch.fx.Node) -> bool:
+    """Whether ``fx_node`` is plain Python arithmetic or indexing over nothing but metadata."""
+    if fx_node.op != "call_function" or getattr(fx_node.target, "__module__", "") not in _SCALAR_MODULES:
+        return False
+    inputs = fx_node.all_input_nodes
+    return bool(inputs) and all(upstream in plumbing for upstream in inputs)
 
 
 def _to_ir(fx_node: torch.fx.Node, graph_module: torch.fx.GraphModule) -> Node | None:

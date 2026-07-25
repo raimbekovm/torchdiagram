@@ -6,9 +6,16 @@ hand-built ones alike, and require no changes to the renderers.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 
-from .graph import Edge, Graph, Node
+from .graph import Edge, Graph, Node, scope_leaf
+
+# Containers that hold layers without being one. Their class name says nothing about what a block does, so a collapsed
+# block gets named after the attribute holding it — "classifier" rather than "Sequential".
+_CONTAINERS = frozenset({"Sequential", "ModuleList", "ModuleDict"})
+
+_Signature = tuple[tuple[str, ...], tuple[tuple[int, ...], ...], tuple[bool, ...]]
 
 
 @dataclass
@@ -47,9 +54,10 @@ def aggregate_blocks(graph: Graph, *, min_repeats: int = 2) -> Graph:
         in its original order.
     """
     nodes, edges = list(graph.nodes), list(graph.edges)
+    structure: dict[str, str] = {}  # synthetic node id -> digest of everything that node collapsed
     max_depth = max((_depth(node.scope) for node in nodes if node.scope is not None), default=0)
     for depth in range(max_depth, 0, -1):
-        nodes, edges = _aggregate_one_level(nodes, edges, depth, min_repeats)
+        nodes, edges = _aggregate_one_level(nodes, edges, depth, min_repeats, structure)
 
     result = Graph(name=graph.name, nodes=nodes, edges=edges)
     result.validate()
@@ -68,7 +76,7 @@ def _parent_scope(scope: str) -> str | None:
 
 
 def _aggregate_one_level(
-    nodes: list[Node], edges: list[Edge], target_depth: int, min_repeats: int
+    nodes: list[Node], edges: list[Edge], target_depth: int, min_repeats: int, structure: dict[str, str]
 ) -> tuple[list[Node], list[Edge]]:
     """Collapse eligible scope groups at exactly ``target_depth``, leaving other depths untouched."""
     incoming: dict[str, list[Edge]] = {}
@@ -79,7 +87,7 @@ def _aggregate_one_level(
 
     path_class = {node.scope: node.scope_class for node in nodes if node.scope is not None}
     segments = _segment_by_scope(nodes, target_depth)
-    items = _merge_runs(segments, incoming, outgoing)
+    items = _merge_runs(segments, incoming, outgoing, structure)
 
     new_nodes: list[Node] = []
     collapsed: dict[str, str] = {}
@@ -89,7 +97,7 @@ def _aggregate_one_level(
             continue
         runs = [item] if len(item) >= min_repeats else [[group] for group in item]
         for run in runs:
-            synthetic = _synthesize(run)
+            synthetic = _synthesize(run, _signature(run[0], incoming, structure), structure)
             parent = _parent_scope(run[0].scope)
             synthetic.scope = parent
             synthetic.scope_class = path_class.get(parent) if parent is not None else None
@@ -132,6 +140,7 @@ def _merge_runs(
     segments: list[Node | _Group],
     incoming: dict[str, list[Edge]],
     outgoing: dict[str, list[Edge]],
+    structure: dict[str, str],
 ) -> list[Node | list[_Group]]:
     """Scan ``segments`` for maximal runs of adjacent, eligible, structurally matching groups.
 
@@ -150,7 +159,7 @@ def _merge_runs(
             items.extend(segment.nodes)
             i += 1
             continue
-        signature = _signature(segment, incoming, outgoing)
+        signature = _signature(segment, incoming, structure)
         run = [segment]
         j = i + 1
         while j < len(segments):
@@ -159,7 +168,7 @@ def _merge_runs(
                 not isinstance(candidate, _Group)
                 or not _eligible(candidate, incoming, outgoing)
                 or candidate.scope_class != segment.scope_class
-                or _signature(candidate, incoming, outgoing) != signature
+                or _signature(candidate, incoming, structure) != signature
             ):
                 break
             run.append(candidate)
@@ -182,21 +191,40 @@ def _eligible(group: _Group, incoming: dict[str, list[Edge]], outgoing: dict[str
     return all(edge.source == last_id for edge in exit_edges)
 
 
-def _op_key(node: Node) -> str:
-    """Signature key for a node's operation: disambiguates synthetic ``"block"`` nodes by what they collapsed."""
+def _op_key(node: Node, structure: dict[str, str]) -> str:
+    """Signature key for one node: what it computes, precise enough that two nodes match only if interchangeable.
+
+    Layer configuration is part of the key, because two blocks are the same block only if their layers are sized the
+    same: a VGG stage running 64 channels and the next one running 128 share an op sequence but are not repeats of each
+    other, and badging them ``×2`` would claim they are.
+
+    A collapsed block is keyed by the digest of what it collapsed rather than by its class name, since the class of a
+    block says nothing about its contents — an ``nn.Sequential`` of two convolutions and one of three are both
+    ``Sequential``. Blocks that came from somewhere other than this transform have no digest, so they fall back to the
+    class name, which is all a hand-built graph records.
+    """
     if node.op == "block":
-        return f"block:{node.params.get('block_class')}"
-    return node.op
+        return f"block:{structure.get(node.id) or node.params.get('block_class')}"
+    return f"{node.op}:{node.params.get('config', '')}"
 
 
-def _signature(
-    group: _Group, incoming: dict[str, list[Edge]], outgoing: dict[str, list[Edge]]
-) -> tuple[tuple[str, ...], tuple[tuple[int, ...], ...], tuple[bool, ...]]:
+def _fingerprint(scope_class: str, repeats: int, signature: _Signature) -> str:
+    """Digest everything a collapsed run contains, so the level above can compare it in one string comparison."""
+    payload = repr((scope_class, repeats, signature))
+    return hashlib.blake2s(payload.encode(), digest_size=8).hexdigest()
+
+
+def _block_name(scope: str, scope_class: str) -> str:
+    """Name a collapsed block after its class, or after the attribute holding it when the class is a bare container."""
+    return scope_leaf(scope) if scope_class in _CONTAINERS else scope_class
+
+
+def _signature(group: _Group, incoming: dict[str, list[Edge]], structure: dict[str, str]) -> _Signature:
     """A structural fingerprint of ``group``, independent of node ids, for cross-group comparison."""
     ids = [node.id for node in group.nodes]
     id_set = set(ids)
     index = {node_id: i for i, node_id in enumerate(ids)}
-    ops = tuple(_op_key(node) for node in group.nodes)
+    ops = tuple(_op_key(node, structure) for node in group.nodes)
     topology = []
     external_entry = []
     for i, node_id in enumerate(ids):
@@ -207,15 +235,22 @@ def _signature(
     return ops, tuple(topology), tuple(external_entry)
 
 
-def _synthesize(run: list[_Group]) -> Node:
-    """Build the single synthetic node that replaces a collapsed run of matching groups."""
+def _synthesize(run: list[_Group], signature: _Signature, structure: dict[str, str]) -> Node:
+    """Build the single synthetic node that replaces a collapsed run of matching groups.
+
+    The node's digest is registered in ``structure`` on the way out, so that when the next level up compares this block
+    against its siblings it compares contents rather than class names.
+    """
     first, last = run[0], run[-1]
     repeats = len(run)
-    label = first.scope_class if repeats == 1 else f"{first.scope_class} ×{repeats}"
-    return Node(
+    name = _block_name(first.scope, first.scope_class)
+    label = name if repeats == 1 else f"{name} ×{repeats}"
+    node = Node(
         id=f"{first.nodes[0].id}__agg",
         op="block",
         label=label,
         params={"repeats": repeats, "block_class": first.scope_class, "ops_per_repeat": len(first.nodes)},
         output_shape=last.nodes[-1].output_shape,
     )
+    structure[node.id] = _fingerprint(first.scope_class, repeats, signature)
+    return node
