@@ -9,6 +9,7 @@ from __future__ import annotations
 from xml.sax.saxutils import escape
 
 from torchdiagram.graph import Graph, Node
+from torchdiagram.renderers._format import length
 from torchdiagram.theme import DEFAULT, Theme
 
 _PAD = 24
@@ -34,8 +35,8 @@ def to_svg(graph: Graph, *, theme: Theme = DEFAULT) -> str:
     box_w = max(150, int(longest * _CHAR_W) + 28)
 
     index = {node.id: i for i, node in enumerate(graph.nodes)}
-    skip_edges = [e for e in graph.edges if abs(index[e.target] - index[e.source]) > 1]
-    lanes = {(e.source, e.target): lane for lane, e in enumerate(skip_edges, start=1)}
+    skip_edges = [edge for edge in graph.edges if abs(index[edge.target] - index[edge.source]) > 1]
+    lanes = {(edge.source, edge.target): lane for lane, edge in enumerate(skip_edges, start=1)}
 
     center_x = _PAD + box_w / 2
     right_x = _PAD + box_w
@@ -72,8 +73,8 @@ def to_svg(graph: Graph, *, theme: Theme = DEFAULT) -> str:
                 f'fill="none" stroke="{theme.edge_color}" stroke-width="1.4" marker-end="url(#arrow)"/>'
             )
 
-    rx = _num(theme.corner_radius)
-    stroke_w = _num(theme.stroke_width)
+    rx = length(theme.corner_radius)
+    stroke_w = length(theme.stroke_width)
     for i, node in enumerate(graph.nodes):
         y = y_top(i)
         fill, stroke = (theme.io_fill, theme.io_stroke) if node.is_io else (theme.block_fill, theme.block_stroke)
@@ -91,11 +92,6 @@ def to_svg(graph: Graph, *, theme: Theme = DEFAULT) -> str:
 
     parts.append("</svg>")
     return "\n".join(parts) + "\n"
-
-
-def _num(value: float) -> str:
-    """Format a length without a trailing ``.0`` (so ``6.0`` becomes ``"6"``, ``1.2`` stays ``"1.2"``)."""
-    return str(int(value)) if value == int(value) else str(value)
 
 
 def _text(x: float, y: float, content: str, *, size: int, fill: str) -> str:

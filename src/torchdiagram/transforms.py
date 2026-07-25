@@ -87,10 +87,6 @@ def _aggregate_one_level(
         if isinstance(item, Node):
             new_nodes.append(item)
             continue
-        if not _eligible(item[0], incoming, outgoing):
-            for group in item:
-                new_nodes.extend(group.nodes)
-            continue
         runs = [item] if len(item) >= min_repeats else [[group] for group in item]
         for run in runs:
             synthetic = _synthesize(run)
@@ -119,17 +115,16 @@ def _segment_by_scope(nodes: list[Node], target_depth: int) -> list[Node | _Grou
     segments: list[Node | _Group] = []
     current: _Group | None = None
     for node in nodes:
-        has_scope = node.scope is not None and node.scope_class is not None and _depth(node.scope) == target_depth
-        if has_scope and current is not None and current.scope == node.scope:
+        scope, scope_class = node.scope, node.scope_class
+        if scope is None or scope_class is None or _depth(scope) != target_depth:
+            current = None
+            segments.append(node)
+            continue
+        if current is not None and current.scope == scope:
             current.nodes.append(node)
             continue
-        current = None
-        if has_scope:
-            assert node.scope is not None and node.scope_class is not None  # narrowed by has_scope
-            current = _Group(scope=node.scope, scope_class=node.scope_class, nodes=[node])
-            segments.append(current)
-        else:
-            segments.append(node)
+        current = _Group(scope=scope, scope_class=scope_class, nodes=[node])
+        segments.append(current)
     return segments
 
 
@@ -138,7 +133,11 @@ def _merge_runs(
     incoming: dict[str, list[Edge]],
     outgoing: dict[str, list[Edge]],
 ) -> list[Node | list[_Group]]:
-    """Scan ``segments`` for maximal runs of adjacent, eligible, structurally matching groups."""
+    """Scan ``segments`` for maximal runs of adjacent, eligible, structurally matching groups.
+
+    Groups that fail :func:`_eligible` are dissolved back into their individual nodes here, so everything the caller
+    receives as a run is already known to be collapsible.
+    """
     items: list[Node | list[_Group]] = []
     i = 0
     while i < len(segments):
@@ -148,7 +147,7 @@ def _merge_runs(
             i += 1
             continue
         if not _eligible(segment, incoming, outgoing):
-            items.append([segment])
+            items.extend(segment.nodes)
             i += 1
             continue
         signature = _signature(segment, incoming, outgoing)

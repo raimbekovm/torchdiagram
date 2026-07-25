@@ -7,6 +7,7 @@ graphs can also be built by hand or by future non-PyTorch frontends.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -75,12 +76,11 @@ class Graph:
         Raises:
             ValueError: If two nodes share an id, or an edge references an id not present in ``nodes``.
         """
-        ids = [node.id for node in self.nodes]
-        unique = set(ids)
-        if len(unique) != len(ids):
-            duplicates = sorted({node_id for node_id in ids if ids.count(node_id) > 1})
+        counts = Counter(node.id for node in self.nodes)
+        duplicates = sorted(node_id for node_id, count in counts.items() if count > 1)
+        if duplicates:
             raise ValueError(f"duplicate node ids: {duplicates}")
         for edge in self.edges:
             for ref in (edge.source, edge.target):
-                if ref not in unique:
+                if ref not in counts:
                     raise ValueError(f"edge references unknown node id: {ref!r}")

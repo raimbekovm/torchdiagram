@@ -18,7 +18,8 @@ from torch.fx.passes.shape_prop import ShapeProp
 from .export_trace import trace_export
 from .graph import Edge, Graph, Node
 
-_BACKENDS = ("auto", "fx", "export")
+BACKENDS = ("auto", "fx", "export")
+"""Accepted values for the ``backend`` argument, shared with the CLI's ``--backend`` choices."""
 
 
 def trace(
@@ -51,8 +52,8 @@ def trace(
         UserWarning: If the fallback had to specialize the graph on ``example_input``, meaning branches that input does
             not take are absent from the diagram.
     """
-    if backend not in _BACKENDS:
-        raise ValueError(f"unknown backend {backend!r} (expected one of: {', '.join(_BACKENDS)})")
+    if backend not in BACKENDS:
+        raise ValueError(f"unknown backend {backend!r} (expected one of: {', '.join(BACKENDS)})")
     if backend == "export":
         if example_input is None:
             raise ValueError("backend='export' requires an example input, since torch.export traces with real inputs")
@@ -118,36 +119,33 @@ def _to_ir(fx_node: torch.fx.Node, graph_module: torch.fx.GraphModule) -> Node |
     Returns:
         The corresponding IR node, or ``None`` for ``get_attr`` nodes (parameter/buffer plumbing).
     """
-    shape = _output_shape(fx_node)
-    scope, scope_class = _scope(fx_node)
+    extra = ""  # only a leaf layer has hyperparameters to record
     if fx_node.op == "placeholder":
-        return Node(
-            id=fx_node.name, op="input", label="input", output_shape=shape, scope=scope, scope_class=scope_class
-        )
-    if fx_node.op == "output":
-        return Node(
-            id=fx_node.name, op="output", label="output", output_shape=shape, scope=scope, scope_class=scope_class
-        )
-    if fx_node.op == "call_module":
+        op = label = "input"
+    elif fx_node.op == "output":
+        op = label = "output"
+    elif fx_node.op == "call_module":
         module = graph_module.get_submodule(str(fx_node.target))
-        kind = type(module).__name__
+        label = type(module).__name__
+        op = label.lower()
         extra = module.extra_repr()
-        return Node(
-            id=fx_node.name,
-            op=kind.lower(),
-            label=kind,
-            params={"config": extra} if extra else {},
-            output_shape=shape,
-            scope=scope,
-            scope_class=scope_class,
-        )
-    if fx_node.op == "call_function":
-        label = getattr(fx_node.target, "__name__", str(fx_node.target))
-        return Node(id=fx_node.name, op=label, label=label, output_shape=shape, scope=scope, scope_class=scope_class)
-    if fx_node.op == "call_method":
-        label = str(fx_node.target)
-        return Node(id=fx_node.name, op=label, label=label, output_shape=shape, scope=scope, scope_class=scope_class)
-    return None  # get_attr: parameter/buffer plumbing, not a diagram block
+    elif fx_node.op == "call_function":
+        op = label = getattr(fx_node.target, "__name__", str(fx_node.target))
+    elif fx_node.op == "call_method":
+        op = label = str(fx_node.target)
+    else:
+        return None  # get_attr: parameter/buffer plumbing, not a diagram block
+
+    scope, scope_class = _scope(fx_node)
+    return Node(
+        id=fx_node.name,
+        op=op,
+        label=label,
+        params={"config": extra} if extra else {},
+        output_shape=_output_shape(fx_node),
+        scope=scope,
+        scope_class=scope_class,
+    )
 
 
 def _output_shape(fx_node: torch.fx.Node) -> tuple[int, ...] | None:

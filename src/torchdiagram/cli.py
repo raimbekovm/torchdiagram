@@ -13,7 +13,7 @@ from torch import nn
 
 from torchdiagram.renderers import render
 from torchdiagram.theme import DARK, DEFAULT, MONOCHROME
-from torchdiagram.trace import trace
+from torchdiagram.trace import BACKENDS, trace
 from torchdiagram.transforms import aggregate_blocks
 
 _THEMES = {"default": DEFAULT, "mono": MONOCHROME, "dark": DARK}
@@ -51,7 +51,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--min-repeats",
         type=int,
-        default=None,
+        default=2,
         help="Minimum run length required to collapse with --aggregate (default: 2).",
     )
     parser.add_argument(
@@ -62,7 +62,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--backend",
-        choices=("auto", "fx", "export"),
+        choices=BACKENDS,
         default="auto",
         help="Tracing frontend: 'auto' falls back to torch.export when torch.fx cannot trace the model, "
         "'fx' and 'export' pin one (default: auto).",
@@ -83,8 +83,7 @@ def main(argv: list[str] | None = None) -> None:
         if issubclass(warning.category, UserWarning):
             print(f"note: {warning.message}", file=sys.stderr)
     if args.aggregate:
-        min_repeats_kwargs = {} if args.min_repeats is None else {"min_repeats": args.min_repeats}
-        graph = aggregate_blocks(graph, **min_repeats_kwargs)
+        graph = aggregate_blocks(graph, min_repeats=args.min_repeats)
     try:
         path = render(graph, args.output, theme=_THEMES[args.theme])
     except ValueError as exc:

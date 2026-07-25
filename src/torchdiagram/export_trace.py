@@ -74,8 +74,7 @@ def _export(model: nn.Module, example_input: torch.Tensor) -> tuple[torch.fx.Gra
         example_input: Input to export with.
 
     Returns:
-        A ``(graph_module, specialized)`` pair, where ``specialized`` marks a graph that only describes the branches:
-            ``example_input`` happens to take.
+        The exported graph module, and whether it was specialized on ``example_input`` rather than soundly exported.
 
     Raises:
         Exception: The error from the sound attempt, if the specializing fallback is unavailable or also fails.
@@ -96,12 +95,9 @@ def _export(model: nn.Module, example_input: torch.Tensor) -> tuple[torch.fx.Gra
     return program.module(), not (report is not None and report.successful())
 
 
-class _Mute(logging.Filter):
-    """A logging filter that drops every record it sees."""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        """Reject ``record`` so it never reaches the handler's stream."""
-        return False
+def _drop(record: logging.LogRecord) -> bool:
+    """Reject ``record`` so it never reaches the handler's stream."""
+    return False
 
 
 @contextmanager
@@ -118,15 +114,14 @@ def _quiet_export() -> Iterator[None]:
     """
     names = [name for name in logging.root.manager.loggerDict if name.split(".")[0] == _LOG_PREFIX]
     handlers = {handler for name in [_LOG_PREFIX, *names] for handler in logging.getLogger(name).handlers}
-    mute = _Mute()
     for handler in handlers:
-        handler.addFilter(mute)
+        handler.addFilter(_drop)
     try:
         with redirect_stderr(io.StringIO()):
             yield
     finally:
         for handler in handlers:
-            handler.removeFilter(mute)
+            handler.removeFilter(_drop)
 
 
 def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: str) -> Graph:
@@ -147,15 +142,17 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
     plumbing = _plumbing(graph_module)
 
     for fx_node in graph_module.graph.nodes:
-        node = None
         if fx_node.op in ("placeholder", "output"):
             op = "input" if fx_node.op == "placeholder" else "output"
             node = Node(id=_unique(fx_node.name, used_ids), op=op, label=op, output_shape=_io_shape(fx_node))
-        elif fx_node.op == "call_function" and fx_node not in plumbing:
-            path, module = _leaf_module(model, fx_node)
+        elif fx_node.op != "call_function" or fx_node in plumbing:
+            continue  # get_attr parameter plumbing, the synthetic _guards_fn module, and symbolic guard assertions
+        else:
+            entries = _stack(fx_node)
+            path, module = _leaf_module(model, entries)
             if module is None:
                 label = _label(fx_node.target)
-                scope, scope_class = _scope(fx_node, drop_leaf=False)
+                scope, scope_class = _scope(entries)
                 node = Node(
                     id=_unique(fx_node.name, used_ids),
                     op=label,
@@ -174,7 +171,7 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
             else:
                 kind = type(module).__name__
                 extra = module.extra_repr()
-                scope, scope_class = _scope(fx_node, drop_leaf=True)
+                scope, scope_class = _scope(entries[:-1])  # a layer reports the container holding it, not itself
                 node = Node(
                     id=_unique(path.replace(".", "_"), used_ids),
                     op=kind.lower(),
@@ -185,8 +182,6 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
                     scope_class=scope_class,
                 )
                 by_module[path] = node
-        if node is None:
-            continue  # get_attr parameter plumbing, the synthetic _guards_fn module, and symbolic guard assertions
         owner[fx_node] = node.id
         graph.nodes.append(node)
 
@@ -203,18 +198,19 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
     return graph
 
 
-def _leaf_module(model: nn.Module, fx_node: torch.fx.Node) -> tuple[str, nn.Module | None]:
-    """Resolve the leaf ``nn.Module`` that ``fx_node`` was lowered from, if it was lowered from one.
+def _leaf_module(model: nn.Module, entries: list[tuple[str, object]]) -> tuple[str, nn.Module | None]:
+    """Resolve the leaf ``nn.Module`` a node was lowered from, if it was lowered from one.
+
+    When the node came from functional code instead, the returned path is still the innermost recorded one, which is
+    what scope resolution needs.
 
     Args:
         model: The original module, whose submodule paths ``nn_module_stack`` refers to.
-        fx_node: Node from the exported graph.
+        entries: The node's ``nn_module_stack`` entries.
 
     Returns:
-        A ``(path, module)`` pair. ``module`` is ``None`` when the node came from functional code rather than from a:
-            leaf layer, in which case ``path`` is only meaningful for scope resolution.
+        A ``(path, module)`` pair; ``module`` is ``None`` when the node came from functional code, not a leaf layer.
     """
-    entries = _stack(fx_node)
     if not entries:
         return "", None
     path = entries[-1][0]
@@ -225,19 +221,16 @@ def _leaf_module(model: nn.Module, fx_node: torch.fx.Node) -> tuple[str, nn.Modu
     return path, module if _LEAF_PROBE.is_leaf_module(module, path) else None
 
 
-def _scope(fx_node: torch.fx.Node, *, drop_leaf: bool) -> tuple[str | None, str | None]:
-    """Resolve the immediate custom-container ancestor of ``fx_node``, matching the fx frontend's rule.
+def _scope(entries: list[tuple[str, object]]) -> tuple[str | None, str | None]:
+    """Resolve the immediate custom-container ancestor from ``nn_module_stack`` entries, as the fx frontend does.
 
     Args:
-        fx_node: Node from the exported graph.
-        drop_leaf: Whether to discard the node's own leaf module, so a layer reports the container holding it.
+        entries: The node's ``nn_module_stack`` entries, with the node's own leaf module already sliced off if it has
+            one, so that a layer reports the container holding it rather than itself.
 
     Returns:
         The container's dotted path and class name, or ``(None, None)`` when the node sits at the model root.
     """
-    entries = _stack(fx_node)
-    if drop_leaf:
-        entries = entries[:-1]
     if not entries:
         return None, None
     path, cls = entries[-1]
@@ -327,7 +320,7 @@ def _shape(fx_node: torch.fx.Node) -> tuple[int, ...] | None:
     """Read the node's output shape, which export records for free — no separate shape-propagation pass."""
     val = fx_node.meta.get("val")
     if isinstance(val, (tuple, list)) and len(val) == 1:
-        val = val[0]  # the output node wraps a single-return model's value in a tuple
+        val = val[0]  # a multi-output op that produced exactly one tensor, e.g. split into a single chunk
     if not isinstance(val, torch.Tensor):
         return None
     try:

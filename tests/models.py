@@ -161,16 +161,6 @@ class TransformerStack(nn.Module):
         return x
 
 
-class BranchingModel(nn.Module):
-    """Branches on a runtime tensor value — not fx-traceable, exercises the CLI's tracing-error path."""
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return ``x`` or ``-x`` depending on a data-dependent condition."""
-        if x.sum() > 0:
-            return x
-        return -x
-
-
 class GatedNet(nn.Module):
     """Real layers around a data-dependent branch — the fx-untraceable case the torch.export frontend covers."""
 
