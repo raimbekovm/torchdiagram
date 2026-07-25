@@ -9,25 +9,20 @@ from __future__ import annotations
 from xml.sax.saxutils import escape
 
 from torchdiagram.graph import Graph, Node
+from torchdiagram.theme import DEFAULT, Theme
 
 _PAD = 24
 _GAP = 30
 _CHAR_W = 7.4
 _SKIP_LANE = 28
 
-_BLOCK_FILL = "#e8eef9"
-_BLOCK_STROKE = "#5b7db1"
-_IO_FILL = "#f1f3f5"
-_IO_STROKE = "#8a919a"
-_EDGE_COLOR = "#4c566a"
-_FONT = "'Helvetica Neue', Helvetica, Arial, sans-serif"
 
-
-def to_svg(graph: Graph) -> str:
+def to_svg(graph: Graph, *, theme: Theme = DEFAULT) -> str:
     """Render ``graph`` as a self-contained SVG document string.
 
     Args:
         graph: Graph to render, in execution order.
+        theme: Colors and typography to apply. Defaults to :data:`torchdiagram.theme.DEFAULT`.
 
     Returns:
         A complete SVG document as a string.
@@ -52,11 +47,11 @@ def to_svg(graph: Graph) -> str:
 
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
-        f'viewBox="0 0 {width} {height}" font-family="{_FONT}">',
+        f'viewBox="0 0 {width} {height}" font-family="{theme.font_family}">',
         f"<title>{escape(graph.name)}</title>",
         "<defs>",
         '<marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" '
-        f'orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="{_EDGE_COLOR}"/></marker>',
+        f'orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="{theme.edge_color}"/></marker>',
         "</defs>",
     ]
 
@@ -66,7 +61,7 @@ def to_svg(graph: Graph) -> str:
             y1, y2 = y_top(si) + box_h, y_top(ti) - 2
             parts.append(
                 f'<line x1="{center_x}" y1="{y1}" x2="{center_x}" y2="{y2}" '
-                f'stroke="{_EDGE_COLOR}" stroke-width="1.4" marker-end="url(#arrow)"/>'
+                f'stroke="{theme.edge_color}" stroke-width="1.4" marker-end="url(#arrow)"/>'
             )
         else:
             lane_x = right_x + lanes[(edge.source, edge.target)] * _SKIP_LANE
@@ -74,28 +69,36 @@ def to_svg(graph: Graph) -> str:
             y2 = y_top(ti) + box_h / 2
             parts.append(
                 f'<path d="M {right_x} {y1} C {lane_x} {y1}, {lane_x} {y2}, {right_x + 3} {y2}" '
-                f'fill="none" stroke="{_EDGE_COLOR}" stroke-width="1.4" marker-end="url(#arrow)"/>'
+                f'fill="none" stroke="{theme.edge_color}" stroke-width="1.4" marker-end="url(#arrow)"/>'
             )
 
+    rx = _num(theme.corner_radius)
+    stroke_w = _num(theme.stroke_width)
     for i, node in enumerate(graph.nodes):
         y = y_top(i)
-        fill, stroke = (_IO_FILL, _IO_STROKE) if node.is_io else (_BLOCK_FILL, _BLOCK_STROKE)
+        fill, stroke = (theme.io_fill, theme.io_stroke) if node.is_io else (theme.block_fill, theme.block_stroke)
+        text_color = theme.io_text if node.is_io else theme.block_text
         parts.append(
-            f'<rect x="{_PAD}" y="{y}" width="{box_w}" height="{box_h}" rx="6" '
-            f'fill="{fill}" stroke="{stroke}" stroke-width="1.2"/>'
+            f'<rect x="{_PAD}" y="{y}" width="{box_w}" height="{box_h}" rx="{rx}" '
+            f'fill="{fill}" stroke="{stroke}" stroke-width="{stroke_w}"/>'
         )
         lines = lines_by_id[node.id]
         if len(lines) == 1:
-            parts.append(_text(center_x, y + box_h / 2, lines[0], size=13))
+            parts.append(_text(center_x, y + box_h / 2, lines[0], size=13, fill=text_color))
         else:
-            parts.append(_text(center_x, y + box_h * 0.36, lines[0], size=13))
-            parts.append(_text(center_x, y + box_h * 0.72, lines[1], size=11, fill="#68707c"))
+            parts.append(_text(center_x, y + box_h * 0.36, lines[0], size=13, fill=text_color))
+            parts.append(_text(center_x, y + box_h * 0.72, lines[1], size=11, fill=theme.shape_text))
 
     parts.append("</svg>")
     return "\n".join(parts) + "\n"
 
 
-def _text(x: float, y: float, content: str, *, size: int, fill: str = "#2e3440") -> str:
+def _num(value: float) -> str:
+    """Format a length without a trailing ``.0`` (so ``6.0`` becomes ``"6"``, ``1.2`` stays ``"1.2"``)."""
+    return str(int(value)) if value == int(value) else str(value)
+
+
+def _text(x: float, y: float, content: str, *, size: int, fill: str) -> str:
     """Build a centered SVG ``<text>`` element."""
     return (
         f'<text x="{x}" y="{y}" text-anchor="middle" dominant-baseline="central" '

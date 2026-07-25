@@ -86,7 +86,7 @@ Pre-alpha. The core pipeline works end-to-end:
 - [x] CLI (`torchdiagram pkg.module:Model -o out.svg`)
 - [x] Block aggregation — collapse repeated layers so deep networks render compactly
 - [x] Presets for attention/transformer blocks
-- [ ] Styling/theme API
+- [x] Styling/theme API
 - [ ] Fallback tracer for data-dependent control flow (`torch.export`)
 - [ ] PNG export
 - [ ] PyPI release

@@ -65,3 +65,21 @@ def test_cli_rejects_unsupported_output_extension():
     """An unsupported output extension exits with a clear error."""
     with pytest.raises(SystemExit, match="unsupported output format"):
         main(["tests.models:TinyCNN", "-o", "out.png"])
+
+
+def test_cli_theme_flag_applies_preset(tmp_path):
+    """'--theme dark' renders with the dark preset's palette, not the default one."""
+    import torchdiagram as td
+
+    output = tmp_path / "tiny.svg"
+    main(["tests.models:TinyCNN", "-o", str(output), "--theme", "dark"])
+    content = output.read_text()
+    # block_stroke is unique to DARK ("#81a1c1"); block_fill would also appear under DEFAULT.
+    assert td.DARK.block_stroke in content
+    assert td.DEFAULT.block_stroke not in content
+
+
+def test_cli_rejects_unknown_theme():
+    """An unknown '--theme' value exits with a usage error."""
+    with pytest.raises(SystemExit):
+        main(["tests.models:TinyCNN", "-o", "out.svg", "--theme", "bogus"])

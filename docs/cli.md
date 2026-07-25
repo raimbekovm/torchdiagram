@@ -5,7 +5,7 @@ The `torchdiagram` command traces a model given by an import path and writes a r
 ## Synopsis
 
 ```bash
-torchdiagram MODEL -o OUTPUT [--input-shape SHAPE] [--aggregate] [--min-repeats N]
+torchdiagram MODEL -o OUTPUT [--input-shape SHAPE] [--aggregate] [--min-repeats N] [--theme NAME]
 ```
 
 ## Arguments
@@ -17,6 +17,7 @@ torchdiagram MODEL -o OUTPUT [--input-shape SHAPE] [--aggregate] [--min-repeats 
 | `--input-shape`  | no       | Comma-separated input shape, e.g. `1,3,224,224`. Enables output-shape annotations on every node.                                                                 |
 | `--aggregate`    | no       | Collapse scoped blocks — repeated (e.g. ResNet layers) and singleton (e.g. a transformer's attention/MLP sub-block) — into single labeled nodes. Off by default. |
 | `--min-repeats`  | no       | Minimum run length required to merge multiple blocks into one badged node with `--aggregate` (default: `2`); shorter runs still collapse individually.           |
+| `--theme`        | no       | Color theme: `default` (soft blue), `mono` (grayscale, for print), or `dark` (for dark backgrounds). Default: `default`.                                         |
 
 ## Model specification
 
@@ -48,6 +49,9 @@ torchdiagram torchvision.models:resnet18 -o resnet18.tex --input-shape 1,3,224,2
 
 # Collapse repeated residual blocks into single labeled nodes
 torchdiagram torchvision.models:resnet50 -o resnet50.svg --input-shape 1,3,224,224 --aggregate
+
+# Grayscale figure for a print paper
+torchdiagram torchvision.models:resnet18 -o resnet18.tex --input-shape 1,3,224,224 --theme mono
 ```
 
 ## Exit behavior

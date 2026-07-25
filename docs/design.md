@@ -53,6 +53,14 @@ Deferred to a future iteration:
 - **Pure-delegation parent containers don't propagate a class name upward.** A synthetic node's `scope_class` for the next pass is looked up from _other_ nodes in the current pass that already carry that exact parent scope directly (e.g. a residual `add` sitting right in the parent's `forward()`). If the parent container does nothing but call its children (`forward(self, x): return self.mlp(self.attn(x))`, no op of its own), no node ever carries that scope, so the lookup comes back `None` and the parent's own repeats are never recognized as a group — each child sub-block still collapses on its own, just without the outer merge. Fixing this generally needs `trace()` to record a node's full ancestor scope chain (not just the immediate one), which is a `trace.py`/`graph.py` change, not a `transforms.py` one; deferred since the common case (a residual-connection container) already works.
 - A structural-only fallback for frontends that don't populate `scope` — graphs without scope info simply don't aggregate; this degrades gracefully rather than erroring.
 
+### Theming
+
+`Theme` (`theme.py`) is a frozen, torch-free dataclass — like the IR — that both renderers accept as an optional keyword. It is deliberately **color-first**: colors are the one part of the visual contract that maps cleanly onto both backends (SVG writes them literally; TikZ emits a `\definecolor` per field and references it by name), so a single `Theme` value drives an SVG preview and its TikZ counterpart to the same look. This also unified the two renderers' defaults: TikZ previously used its own grayscale palette (`black!60`/`black!5`), and now shares `DEFAULT`'s blue palette with SVG — the old grayscale look is available as the `MONOCHROME` preset.
+
+Two length fields (`corner_radius`, `stroke_width`) are carried too, each applied in the backend's native unit (pixels in SVG, points in TikZ) — a documented approximation rather than an exact cross-backend match. Sharing `DEFAULT` also nudges the TikZ default geometry to match SVG's: block corners move from `2pt` to `6pt` and the outline gains an explicit `1.2pt` width. `font_family` is SVG-only, since LaTeX font selection is a preamble/package concern.
+
+Deferred: **themeable geometry** (node spacing, box size). SVG lays out in pixels and TikZ in millimeters, so a shared "node distance" field would have no single honest unit; the spacing constants stay renderer-internal until there's a reason to abstract them. Frontends and renderers that don't recognize a field simply ignore it — the same graceful-degradation stance as the rest of the pipeline.
+
 ## Non-goals
 
 The project is deliberately scoped to code-to-diagram generation for static figures:

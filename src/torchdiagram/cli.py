@@ -11,8 +11,11 @@ import torch
 from torch import nn
 
 from torchdiagram.renderers import render
+from torchdiagram.theme import DARK, DEFAULT, MONOCHROME
 from torchdiagram.trace import trace
 from torchdiagram.transforms import aggregate_blocks
+
+_THEMES = {"default": DEFAULT, "mono": MONOCHROME, "dark": DARK}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -50,6 +53,12 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="Minimum run length required to collapse with --aggregate (default: 2).",
     )
+    parser.add_argument(
+        "--theme",
+        choices=sorted(_THEMES),
+        default="default",
+        help="Color theme for the diagram (default: default).",
+    )
     args = parser.parse_args(argv)
 
     model = _load_model(args.model)
@@ -62,7 +71,7 @@ def main(argv: list[str] | None = None) -> None:
         min_repeats_kwargs = {} if args.min_repeats is None else {"min_repeats": args.min_repeats}
         graph = aggregate_blocks(graph, **min_repeats_kwargs)
     try:
-        path = render(graph, args.output)
+        path = render(graph, args.output, theme=_THEMES[args.theme])
     except ValueError as exc:
         raise SystemExit(f"error: {exc}") from exc
     print(f"wrote {path}")

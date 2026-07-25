@@ -125,6 +125,34 @@ The TikZ renderer produces a standalone LaTeX document:
 
 Node styles are defined once at the top of the picture (`block`, `io`, `arrow`), so the appearance of the whole diagram can be adjusted by editing those three style definitions. Labels are escaped for LaTeX; characters such as `_`, `&`, and `%` in layer names render literally.
 
+### Theming
+
+`render()`, `to_svg()`, and `to_tikz()` all take a `theme` keyword — a `Theme` value carrying the diagram's colors and typography. Three presets ship with the package:
+
+```python
+td.render(graph, "model.svg")  # td.DEFAULT — soft blue, the implicit default
+td.render(graph, "model.svg", theme=td.MONOCHROME)  # grayscale, for print figures
+td.render(graph, "model.svg", theme=td.DARK)  # for dark backgrounds
+```
+
+Build your own by copying a preset and overriding fields with `dataclasses.replace`:
+
+```python
+from dataclasses import replace
+
+theme = replace(td.DEFAULT, block_fill="#fff3cd", block_stroke="#e0a800", edge_color="#555555")
+td.render(graph, "model.svg", theme=theme)
+```
+
+All colors are hex strings; see [the `Theme` field table](api.md#tdtheme) for the full list. A `Theme` is frozen, so the shared presets can't be mutated in place — always build a new one with `replace`.
+
+The same theme drives both renderers, so an SVG preview and its TikZ counterpart match. Two caveats follow from the backends differing:
+
+- `font_family` applies to SVG only. TikZ uses the LaTeX document's font; set it in your `.tex` preamble instead.
+- `corner_radius` and `stroke_width` are interpreted in each backend's native unit (pixels for SVG, points for TikZ), so they're a close visual match rather than an exact one.
+
+Geometry — node spacing and box size — is not themeable yet; SVG measures in pixels and TikZ in millimeters, so a single shared value would have no honest unit.
+
 ## Working with the graph IR
 
 `trace()` returns a `Graph` — a plain dataclass containing `Node` and `Edge` lists with no torch dependency. It can be inspected and modified before rendering:
