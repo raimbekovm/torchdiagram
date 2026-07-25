@@ -84,7 +84,14 @@ def test_cli_rejects_factory_that_needs_arguments():
 def test_cli_rejects_unsupported_output_extension():
     """An unsupported output extension exits with a clear error."""
     with pytest.raises(SystemExit, match="unsupported output format"):
-        main(["tests.models:TinyCNN", "-o", "out.png"])
+        main(["tests.models:TinyCNN", "-o", "out.pdf"])
+
+
+def test_cli_writes_png(tmp_path):
+    """A '.png' output path is rasterized rather than written as text."""
+    output = tmp_path / "tiny.png"
+    main(["tests.models:TinyCNN", "-o", str(output), "--scale", "1"])
+    assert output.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
 
 
 def test_cli_theme_flag_applies_preset(tmp_path):

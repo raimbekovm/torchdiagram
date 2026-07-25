@@ -118,15 +118,17 @@ graph = td.aggregate_blocks(graph, min_repeats=3)  # only merge runs of 3 or mor
 td.render(graph, "model.svg")  # SVG
 td.render(graph, "model.tex")  # TikZ (standalone LaTeX document)
 td.render(graph, "model.tikz")  # TikZ, same content as .tex
+td.render(graph, "model.png")  # PNG, needs the optional rasterizer
 ```
 
 An unsupported extension raises `ValueError`. The graph is validated before writing; a graph with duplicate node ids or edges that reference missing nodes is rejected.
 
-To obtain the output as a string instead of a file, call the format functions directly:
+To obtain the output in memory instead of a file, call the format functions directly:
 
 ```python
 svg_text = td.to_svg(graph)
 tikz_text = td.to_tikz(graph)
+png_bytes = td.to_png(graph)
 ```
 
 ### SVG output
@@ -144,9 +146,28 @@ The TikZ renderer produces a standalone LaTeX document:
 
 Node styles are defined once at the top of the picture (`block`, `io`, `arrow`), so the appearance of the whole diagram can be adjusted by editing those three style definitions. Labels are escaped for LaTeX; characters such as `_`, `&`, and `%` in layer names render literally.
 
+### PNG output
+
+PNG is the SVG rendering rasterized, for places that won't display vector graphics — a slide deck, an issue thread, a chat message. It needs one optional dependency, a prebuilt [resvg](https://github.com/linebender/resvg) wheel that pulls in no system libraries:
+
+```bash
+pip install 'torchdiagram[png]'
+```
+
+Without it, `to_png()` and `render(..., "model.png")` raise `ImportError` naming the extra; the vector formats are unaffected either way. On macOS with Python 3.10 there is no prebuilt wheel and pip falls back to building it from source, which needs a Rust toolchain; Python 3.11 and newer are covered.
+
+`scale` multiplies the SVG's own pixel dimensions, so a 400×600 diagram becomes an 800×1200 image at the default `2.0`:
+
+```python
+td.render(graph, "model.png", scale=3.0)  # 3× resolution, e.g. for a slide
+png_bytes = td.to_png(graph, scale=1.0)  # 1:1 with the SVG
+```
+
+Two properties are worth knowing before embedding the result. The background stays transparent, as in the SVG, so the diagram sits on whatever page it lands on — pair the `DARK` preset with a dark page and `DEFAULT` or `MONOCHROME` with a light one. And label text is typeset with the system fonts matching the theme's `font_family`; in a minimal container with no fonts installed the boxes and arrows still render but the text is silently dropped, so prefer SVG or TikZ there.
+
 ### Theming
 
-`render()`, `to_svg()`, and `to_tikz()` all take a `theme` keyword — a `Theme` value carrying the diagram's colors and typography. Three presets ship with the package:
+`render()`, `to_svg()`, `to_tikz()`, and `to_png()` all take a `theme` keyword — a `Theme` value carrying the diagram's colors and typography. Three presets ship with the package:
 
 ```python
 td.render(graph, "model.svg")  # td.DEFAULT — soft blue, the implicit default
@@ -165,7 +186,7 @@ td.render(graph, "model.svg", theme=theme)
 
 All colors are hex strings; see [the `Theme` field table](api.md#tdtheme) for the full list. A `Theme` is frozen, so the shared presets can't be mutated in place — always build a new one with `replace`.
 
-The same theme drives both renderers, so an SVG preview and its TikZ counterpart match. Two caveats follow from the backends differing:
+The same theme drives every renderer, so an SVG preview, its PNG rasterization, and its TikZ counterpart match. Two caveats follow from the backends differing:
 
 - `font_family` applies to SVG only. TikZ uses the LaTeX document's font; set it in your `.tex` preamble instead.
 - `corner_radius` and `stroke_width` are interpreted in each backend's native unit (pixels for SVG, points for TikZ), so they're a close visual match rather than an exact one.

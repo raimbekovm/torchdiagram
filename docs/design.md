@@ -3,7 +3,7 @@
 ## Pipeline
 
 ```text
-nn.Module ──▶ frontend (trace.py, export_trace.py) ──▶ IR (graph.py) ──▶ transforms (transforms.py) ──▶ renderers (svg, tikz)
+nn.Module ──▶ frontend (trace.py, export_trace.py) ──▶ IR (graph.py) ──▶ transforms (transforms.py) ──▶ renderers (svg, tikz, png)
 ```
 
 Each stage only knows about the one after it, and everything downstream of the frontend is torch-free.
@@ -53,12 +53,15 @@ One practical wrinkle: `draft_export`'s real-tensor logging calls `inspect.getso
 
 Node order in `Graph.nodes` is the topological/execution order, which is what `torch.fx` emits; renderers rely on it for layout instead of re-deriving it.
 
-### Why two renderers, and why these two
+### Why these renderers
 
 - **SVG** is the preview path: viewable in any browser or editor, with no toolchain required to produce or inspect a draft.
 - **TikZ** is the publication path: a standalone document that compiles as-is, whose `tikzpicture` can be pasted into a paper. Vector output, editable by the user afterwards.
+- **PNG** is the paste-anywhere path, for the surfaces that won't display vector graphics at all: slide decks, issue threads, chat.
 
-Renderers are pure functions `Graph -> str`; `render()` only dispatches on file extension and writes the file. A new format (PNG via resvg, Mermaid, draw.io XML) is one module plus one dictionary entry.
+Renderers are pure functions of the IR; `render()` only dispatches on file extension and writes the file. A new text format (Mermaid, draw.io XML) is one module plus one dictionary entry.
+
+PNG is deliberately not a renderer of its own: it rasterizes the SVG rather than laying the graph out again, so the two can never drift apart, and every layout fix lands in one place. Rasterization goes through the `resvg-py` wheel, chosen over cairosvg because it needs no system libraries, and over an SVG-to-PDF converter because the output has to be embeddable as an image. It is an **optional** dependency behind the `png` extra: the formats a paper or README usually wants need nothing beyond the standard library, and `to_png()` fails with an `ImportError` naming the extra rather than making every install carry a rasterizer. It is also the one format with a `scale` knob, since a raster image, unlike SVG and TikZ, has to commit to a resolution.
 
 ### Block aggregation
 
@@ -82,7 +85,7 @@ Deferred to a future iteration:
 
 ### Theming
 
-`Theme` (`theme.py`) is a frozen, torch-free dataclass — like the IR — that both renderers accept as an optional keyword. It is deliberately **color-first**: colors are the one part of the visual contract that maps cleanly onto both backends (SVG writes them literally; TikZ emits a `\definecolor` per field and references it by name), so a single `Theme` value drives an SVG preview and its TikZ counterpart to the same look. This also unified the two renderers' defaults: TikZ previously used its own grayscale palette (`black!60`/`black!5`), and now shares `DEFAULT`'s blue palette with SVG — the old grayscale look is available as the `MONOCHROME` preset.
+`Theme` (`theme.py`) is a frozen, torch-free dataclass — like the IR — that every renderer accepts as an optional keyword. It is deliberately **color-first**: colors are the one part of the visual contract that maps cleanly onto both backends (SVG writes them literally; TikZ emits a `\definecolor` per field and references it by name), so a single `Theme` value drives an SVG preview and its TikZ counterpart to the same look. This also unified the two renderers' defaults: TikZ previously used its own grayscale palette (`black!60`/`black!5`), and now shares `DEFAULT`'s blue palette with SVG — the old grayscale look is available as the `MONOCHROME` preset.
 
 Two length fields (`corner_radius`, `stroke_width`) are carried too, each applied in the backend's native unit (pixels in SVG, points in TikZ) — a documented approximation rather than an exact cross-backend match. Sharing `DEFAULT` also nudges the TikZ default geometry to match SVG's: block corners move from `2pt` to `6pt` and the outline gains an explicit `1.2pt` width. `font_family` is SVG-only, since LaTeX font selection is a preamble/package concern.
 

@@ -23,6 +23,7 @@ keywords = [
     "tikz",
     "latex",
     "svg",
+    "png",
     "torch-fx",
 ]
 classifiers = [
@@ -39,6 +40,11 @@ classifiers = [
     "Typing :: Typed",
 ]
 
+[project.optional-dependencies]
+# Rasterizer for .png output. A prebuilt wheel with no system libraries, kept optional because
+# SVG and TikZ, the formats a paper or README usually wants, need nothing beyond the standard library.
+png = ["resvg-py>=0.3"]
+
 [project.urls]
 Repository = "https://github.com/raimbekovm/torchdiagram"
 Issues = "https://github.com/raimbekovm/torchdiagram/issues"
@@ -51,6 +57,7 @@ torchdiagram = "torchdiagram.cli:main"
 dev = [
     "mypy>=1.13",
     "pytest>=8.0",
+    "resvg-py>=0.3",
     "ruff>=0.8",
 ]
 

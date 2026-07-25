@@ -27,7 +27,8 @@ def main(argv: list[str] | None = None) -> None:
 
     Raises:
         SystemExit: If the model cannot be loaded, ``--input-shape`` is invalid or missing when the chosen backend needs
-            it, no tracing frontend can handle the model, or the output path has an unsupported extension.
+            it, no tracing frontend can handle the model, the output path has an unsupported extension, or ``.png``
+            output was requested without the optional rasterizer installed.
     """
     parser = argparse.ArgumentParser(
         prog="torchdiagram",
@@ -38,7 +39,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Import path to the model as 'package.module:attr'; attr may be an nn.Module instance, "
         "an nn.Module subclass, or a zero-argument factory function.",
     )
-    parser.add_argument("-o", "--output", required=True, help="Output file (.svg, .tex, .tikz).")
+    parser.add_argument("-o", "--output", required=True, help="Output file (.svg, .png, .tex, .tikz).")
     parser.add_argument(
         "--input-shape",
         help="Comma-separated input shape, e.g. '1,3,224,224'; enables shape annotations on every node.",
@@ -59,6 +60,12 @@ def main(argv: list[str] | None = None) -> None:
         choices=sorted(_THEMES),
         default="default",
         help="Color theme for the diagram (default: default).",
+    )
+    parser.add_argument(
+        "--scale",
+        type=float,
+        default=2.0,
+        help="Pixel scale factor for .png output (default: 2.0); ignored by the vector formats.",
     )
     parser.add_argument(
         "--backend",
@@ -85,8 +92,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.aggregate:
         graph = aggregate_blocks(graph, min_repeats=args.min_repeats)
     try:
-        path = render(graph, args.output, theme=_THEMES[args.theme])
-    except ValueError as exc:
+        path = render(graph, args.output, theme=_THEMES[args.theme], scale=args.scale)
+    except (ImportError, ValueError) as exc:
         raise SystemExit(f"error: {exc}") from exc
     print(f"wrote {path}")
 

@@ -3,7 +3,7 @@
 from importlib.metadata import PackageNotFoundError, version
 
 from torchdiagram.graph import Edge, Graph, Node
-from torchdiagram.renderers import render, to_svg, to_tikz
+from torchdiagram.renderers import render, to_png, to_svg, to_tikz
 from torchdiagram.theme import DARK, DEFAULT, MONOCHROME, Theme
 from torchdiagram.trace import trace
 from torchdiagram.transforms import aggregate_blocks
@@ -24,6 +24,7 @@ __all__ = [
     "__version__",
     "aggregate_blocks",
     "render",
+    "to_png",
     "to_svg",
     "to_tikz",
     "trace",
