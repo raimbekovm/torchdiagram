@@ -6,6 +6,7 @@ import argparse
 import importlib
 import os
 import sys
+import warnings
 
 import torch
 from torch import nn
@@ -25,8 +26,8 @@ def main(argv: list[str] | None = None) -> None:
         argv: Command-line arguments to parse, excluding the program name. Defaults to ``sys.argv[1:]`` when ``None``.
 
     Raises:
-        SystemExit: If the model cannot be loaded, ``--input-shape`` is invalid, tracing fails (e.g. due to
-            data-dependent control flow), or the output path has an unsupported extension.
+        SystemExit: If the model cannot be loaded, ``--input-shape`` is invalid or missing when the chosen backend needs
+            it, no tracing frontend can handle the model, or the output path has an unsupported extension.
     """
     parser = argparse.ArgumentParser(
         prog="torchdiagram",
@@ -59,14 +60,28 @@ def main(argv: list[str] | None = None) -> None:
         default="default",
         help="Color theme for the diagram (default: default).",
     )
+    parser.add_argument(
+        "--backend",
+        choices=("auto", "fx", "export"),
+        default="auto",
+        help="Tracing frontend: 'auto' falls back to torch.export when torch.fx cannot trace the model, "
+        "'fx' and 'export' pin one (default: auto).",
+    )
     args = parser.parse_args(argv)
 
     model = _load_model(args.model)
     example = _build_example_input(args.input_shape)
-    try:
-        graph = trace(model, example)
-    except torch.fx.proxy.TraceError as exc:
-        raise SystemExit(f"error: cannot trace {args.model!r}: {exc}") from exc
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", UserWarning)
+        try:
+            graph = trace(model, example, backend=args.backend)
+        except torch.fx.proxy.TraceError as exc:
+            raise SystemExit(f"error: cannot trace {args.model!r}: {exc}") from exc
+        except ValueError as exc:
+            raise SystemExit(f"error: {exc}") from exc
+    for warning in caught:
+        if issubclass(warning.category, UserWarning):
+            print(f"note: {warning.message}", file=sys.stderr)
     if args.aggregate:
         min_repeats_kwargs = {} if args.min_repeats is None else {"min_repeats": args.min_repeats}
         graph = aggregate_blocks(graph, **min_repeats_kwargs)

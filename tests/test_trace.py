@@ -1,9 +1,10 @@
-"""Tests for torch.fx tracing into the torchdiagram IR."""
+"""Tests for tracing into the torchdiagram IR, through both the torch.fx and torch.export frontends."""
 
+import pytest
 import torch
 
 import torchdiagram as td
-from tests.models import RepeatedBlockStack, ResidualBlock, TinyCNN
+from tests.models import GatedNet, RepeatedBlockStack, ResidualBlock, TinyCNN, UnusedBranch
 
 
 def test_trace_produces_valid_graph_with_io_nodes():
@@ -50,6 +51,97 @@ def test_graph_name_defaults_to_class_name():
     """Graph name defaults to the model class name and honors an override."""
     assert td.trace(TinyCNN()).name == "TinyCNN"
     assert td.trace(TinyCNN(), name="custom").name == "custom"
+
+
+def test_fallback_traces_data_dependent_control_flow():
+    """A model fx cannot trace still yields a valid graph, via the torch.export frontend."""
+    with pytest.warns(UserWarning, match="specialized on the example input"):
+        graph = td.trace(GatedNet(), torch.randn(1, 3, 8, 8))
+    graph.validate()
+    labels = [node.label for node in graph.nodes]
+    assert labels[0] == "input"
+    assert labels[-1] == "output"
+    assert "Conv2d" in labels
+    assert "Linear" in labels
+
+
+def test_fallback_keeps_the_branch_the_example_input_takes():
+    """The fallback specializes: only the executed branch reaches the diagram, and guard plumbing does not."""
+    model = GatedNet()
+    with pytest.warns(UserWarning):
+        positive = td.trace(model, torch.full((1, 3, 8, 8), 1.0))
+    with pytest.warns(UserWarning):
+        negative = td.trace(model, torch.full((1, 3, 8, 8), -1.0))
+    # GatedNet negates only when the input sums to zero or less, so each input traces to a different graph.
+    assert "neg" not in [node.op for node in positive.nodes]
+    assert "neg" in [node.op for node in negative.nodes]
+    # Neither the guard machinery nor the branch condition feeding it ('x.sum() > 0' lowers to sum/gt/ne) belongs in
+    # an architecture diagram; only the ops that carry the model's output should survive.
+    assert [node.op for node in positive.nodes] == [
+        "input",
+        "conv2d",
+        "relu",
+        "adaptiveavgpool2d",
+        "flatten",
+        "linear",
+        "output",
+    ]
+
+
+def test_backend_fx_does_not_fall_back():
+    """'backend="fx"' pins symbolic tracing, so an untraceable model still raises."""
+    with pytest.raises(torch.fx.proxy.TraceError):
+        td.trace(GatedNet(), torch.randn(1, 3, 8, 8), backend="fx")
+
+
+def test_fallback_needs_an_example_input():
+    """Without an example input the fallback cannot run, and the error says so."""
+    with pytest.raises(torch.fx.proxy.TraceError, match="Pass an example input"):
+        td.trace(GatedNet())
+
+
+def test_export_backend_requires_an_example_input():
+    """'backend="export"' is rejected without an example input, since torch.export traces with real inputs."""
+    with pytest.raises(ValueError, match="requires an example input"):
+        td.trace(TinyCNN(), backend="export")
+
+
+def test_unknown_backend_is_rejected():
+    """An unrecognized backend name fails fast rather than silently picking a frontend."""
+    with pytest.raises(ValueError, match="unknown backend"):
+        td.trace(TinyCNN(), torch.randn(1, 1, 28, 28), backend="onnx")
+
+
+@pytest.mark.parametrize(
+    ("model", "example"),
+    [
+        (TinyCNN(), torch.randn(1, 1, 28, 28)),
+        (ResidualBlock(), torch.randn(1, 4, 8, 8)),
+        (RepeatedBlockStack(2), torch.randn(1, 3, 8, 8)),
+        (UnusedBranch(), torch.randn(1, 4)),
+    ],
+)
+def test_both_frontends_emit_the_same_ir(model, example):
+    """On a model both frontends can trace, they produce identical graphs — the contract renderers rely on."""
+    by_fx = td.trace(model, example, backend="fx")
+    by_export = td.trace(model, example, backend="export")
+
+    def fields(graph):
+        return [
+            (node.id, node.op, node.label, node.params, node.output_shape, node.scope, node.scope_class)
+            for node in graph.nodes
+        ]
+
+    assert fields(by_fx) == fields(by_export)
+    assert sorted((e.source, e.target) for e in by_fx.edges) == sorted((e.source, e.target) for e in by_export.edges)
+
+
+def test_export_graphs_still_aggregate():
+    """Scope survives the export frontend, so block aggregation works on its graphs unchanged."""
+    graph = td.trace(RepeatedBlockStack(4), torch.randn(1, 3, 8, 8), backend="export")
+    collapsed = td.aggregate_blocks(graph)
+    collapsed.validate()
+    assert "BasicBlock ×4" in [node.label for node in collapsed.nodes]
 
 
 def test_trace_records_scope_for_nested_submodules():

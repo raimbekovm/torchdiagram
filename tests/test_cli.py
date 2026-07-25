@@ -49,10 +49,30 @@ def test_cli_rejects_bad_input_shape():
         main(["tests.models:TinyCNN", "-o", "out.svg", "--input-shape", "1,x,3"])
 
 
-def test_cli_rejects_untraceable_model():
-    """A model with data-dependent control flow exits with a clear tracing error."""
+def test_cli_falls_back_for_untraceable_model(tmp_path, capsys):
+    """A model with data-dependent control flow renders through the torch.export fallback, with a note about it."""
+    output = tmp_path / "gated.svg"
+    main(["tests.models:GatedNet", "-o", str(output), "--input-shape", "1,3,8,8"])
+    assert output.read_text().startswith("<svg")
+    assert "specialized on the example input" in capsys.readouterr().err
+
+
+def test_cli_rejects_untraceable_model_without_input_shape():
+    """Without '--input-shape' the fallback cannot run, so an untraceable model exits with a hint to supply one."""
     with pytest.raises(SystemExit, match="cannot trace"):
-        main(["tests.models:BranchingModel", "-o", "out.svg", "--input-shape", "1,4"])
+        main(["tests.models:GatedNet", "-o", "out.svg"])
+
+
+def test_cli_backend_fx_disables_the_fallback():
+    """'--backend fx' pins symbolic tracing, so an untraceable model exits instead of falling back."""
+    with pytest.raises(SystemExit, match="cannot trace"):
+        main(["tests.models:GatedNet", "-o", "out.svg", "--input-shape", "1,3,8,8", "--backend", "fx"])
+
+
+def test_cli_backend_export_requires_input_shape():
+    """'--backend export' without '--input-shape' exits with a clear error rather than a traceback."""
+    with pytest.raises(SystemExit, match="requires an example input"):
+        main(["tests.models:TinyCNN", "-o", "out.svg", "--backend", "export"])
 
 
 def test_cli_rejects_factory_that_needs_arguments():

@@ -3,8 +3,9 @@
 Built on ``torch.fx`` symbolic tracing, so anything ``symbolic_trace`` can
 handle — residual connections, parallel branches, functional ops inside an
 arbitrary ``forward()`` — is captured without touching the model. Data-dependent
-control flow is the known limitation of symbolic tracing; see docs/design.md
-for the planned fallbacks.
+control flow is the known limitation of symbolic tracing, and is covered by the
+``torch.export`` frontend in :mod:`torchdiagram.export_trace`, which this module
+falls back to automatically; see docs/design.md.
 """
 
 from __future__ import annotations
@@ -14,7 +15,10 @@ import torch.fx
 from torch import nn
 from torch.fx.passes.shape_prop import ShapeProp
 
+from .export_trace import trace_export
 from .graph import Edge, Graph, Node
+
+_BACKENDS = ("auto", "fx", "export")
 
 
 def trace(
@@ -22,8 +26,55 @@ def trace(
     example_input: torch.Tensor | None = None,
     *,
     name: str | None = None,
+    backend: str = "auto",
 ) -> Graph:
     """Trace ``model`` into a renderable graph.
+
+    Args:
+        model: Module to trace; ``forward()`` may be arbitrary fx-traceable code.
+        example_input: When given, a forward pass is shape-propagated so every node carries its output shape. Required
+            by the ``torch.export`` frontend, which cannot trace without concrete arguments.
+        name: Diagram title; defaults to the model's class name.
+        backend: Which frontend to use. ``"auto"`` (the default) symbolically traces with ``torch.fx`` and falls back to
+            ``torch.export`` if that fails; ``"fx"`` and ``"export"`` pin one frontend.
+
+    Returns:
+        The traced graph, with nodes in execution order.
+
+    Raises:
+        ValueError: If ``backend`` is not one of ``"auto"``, ``"fx"``, or ``"export"``, or if ``backend="export"`` is
+            requested without an ``example_input``.
+        torch.fx.proxy.TraceError: If ``model`` is not symbolically traceable and the ``torch.export`` fallback is
+            unavailable, disabled by ``backend="fx"``, or itself unable to export the model.
+
+    Warns:
+        UserWarning: If the fallback had to specialize the graph on ``example_input``, meaning branches that input does
+            not take are absent from the diagram.
+    """
+    if backend not in _BACKENDS:
+        raise ValueError(f"unknown backend {backend!r} (expected one of: {', '.join(_BACKENDS)})")
+    if backend == "export":
+        if example_input is None:
+            raise ValueError("backend='export' requires an example input, since torch.export traces with real inputs")
+        return trace_export(model, example_input, name=name)
+    try:
+        return _trace_fx(model, example_input, name=name)
+    except torch.fx.proxy.TraceError as fx_error:
+        if backend == "fx":
+            raise
+        if example_input is None:
+            raise torch.fx.proxy.TraceError(
+                f"{fx_error}\n\nPass an example input to fall back to the torch.export frontend, which can trace "
+                "data-dependent control flow."
+            ) from fx_error
+        try:
+            return trace_export(model, example_input, name=name)
+        except Exception:
+            raise fx_error from None
+
+
+def _trace_fx(model: nn.Module, example_input: torch.Tensor | None, *, name: str | None) -> Graph:
+    """Trace ``model`` with ``torch.fx`` symbolic tracing.
 
     Args:
         model: Module to trace; ``forward()`` may be arbitrary fx-traceable code.

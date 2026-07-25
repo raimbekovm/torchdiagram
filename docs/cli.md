@@ -5,7 +5,7 @@ The `torchdiagram` command traces a model given by an import path and writes a r
 ## Synopsis
 
 ```bash
-torchdiagram MODEL -o OUTPUT [--input-shape SHAPE] [--aggregate] [--min-repeats N] [--theme NAME]
+torchdiagram MODEL -o OUTPUT [--input-shape SHAPE] [--aggregate] [--min-repeats N] [--theme NAME] [--backend NAME]
 ```
 
 ## Arguments
@@ -18,6 +18,7 @@ torchdiagram MODEL -o OUTPUT [--input-shape SHAPE] [--aggregate] [--min-repeats 
 | `--aggregate`    | no       | Collapse scoped blocks — repeated (e.g. ResNet layers) and singleton (e.g. a transformer's attention/MLP sub-block) — into single labeled nodes. Off by default. |
 | `--min-repeats`  | no       | Minimum run length required to merge multiple blocks into one badged node with `--aggregate` (default: `2`); shorter runs still collapse individually.           |
 | `--theme`        | no       | Color theme: `default` (soft blue), `mono` (grayscale, for print), or `dark` (for dark backgrounds). Default: `default`.                                         |
+| `--backend`      | no       | Tracing frontend: `auto` (falls back to `torch.export` when `torch.fx` cannot trace the model), `fx`, or `export`. Default: `auto`.                              |
 
 ## Model specification
 
@@ -54,6 +55,18 @@ torchdiagram torchvision.models:resnet50 -o resnet50.svg --input-shape 1,3,224,2
 torchdiagram torchvision.models:resnet18 -o resnet18.tex --input-shape 1,3,224,224 --theme mono
 ```
 
+## Data-dependent control flow
+
+A model whose `forward()` branches on tensor values (`if x.sum() > 0:`) cannot be traced by `torch.fx`. Given `--input-shape`, the CLI falls back to the `torch.export` frontend and prints a note on stderr:
+
+```bash
+$ torchdiagram my_models:GatedNet -o gated.svg --input-shape 1,3,8,8
+note: GatedNet was traced with torch.export and specialized on the example input: branches not taken by this input are absent from the diagram
+wrote gated.svg
+```
+
+The diagram then shows only the branch that input takes. Without `--input-shape` the fallback cannot run, since `torch.export` traces by running the model, and the command exits with an error saying so. Use `--backend fx` to disable the fallback and fail instead.
+
 ## Exit behavior
 
-On success, the command prints the path of the written file and exits with status 0. Import failures, invalid model specifications, and unsupported output extensions terminate with a non-zero status and an error message on stderr.
+On success, the command prints the path of the written file and exits with status 0. Import failures, invalid model specifications, models no frontend can trace, and unsupported output extensions terminate with a non-zero status and an error message on stderr.

@@ -171,6 +171,40 @@ class BranchingModel(nn.Module):
         return -x
 
 
+class GatedNet(nn.Module):
+    """Real layers around a data-dependent branch — the fx-untraceable case the torch.export frontend covers."""
+
+    def __init__(self) -> None:
+        """Initialize the stem convolution, the pooling layer, and the classifier head."""
+        super().__init__()
+        self.stem = nn.Conv2d(3, 8, kernel_size=3, padding=1)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.head = nn.Linear(8, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Pool the stem features, negate them when the input sums to zero or less, then classify."""
+        h = torch.flatten(self.pool(F.relu(self.stem(x))), 1)
+        # Branching on the input rather than on activations keeps which branch runs independent of random init.
+        if x.sum() > 0:
+            return self.head(h)
+        return self.head(-h)
+
+
+class UnusedBranch(nn.Module):
+    """Computes a layer it never returns — dead code both frontends must keep drawing, unlike guard plumbing."""
+
+    def __init__(self) -> None:
+        """Initialize the returned and the unused linear layers."""
+        super().__init__()
+        self.used = nn.Linear(4, 4)
+        self.unused = nn.Linear(4, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply both layers but return only one."""
+        self.unused(x)
+        return self.used(x)
+
+
 class NeedsConstructorArgs(nn.Module):
     """Requires a constructor argument — exercises the CLI's zero-argument-factory error path."""
 

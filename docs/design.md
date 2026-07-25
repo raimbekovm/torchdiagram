@@ -3,7 +3,7 @@
 ## Pipeline
 
 ```text
-nn.Module ──▶ frontend (trace.py) ──▶ IR (graph.py) ──▶ transforms (transforms.py) ──▶ renderers (svg, tikz)
+nn.Module ──▶ frontend (trace.py, export_trace.py) ──▶ IR (graph.py) ──▶ transforms (transforms.py) ──▶ renderers (svg, tikz)
 ```
 
 Each stage only knows about the one after it, and everything downstream of the frontend is torch-free.
@@ -14,7 +14,34 @@ Each stage only knows about the one after it, and everything downstream of the f
 
 The core promise of the tool is "diagram from arbitrary `forward()` code", and `torch.fx.symbolic_trace` is the lowest-friction way to get a faithful dataflow graph out of one: it captures residual connections, parallel branches, and functional ops without requiring the user to modify the model or run real data through it. Shape annotation uses `torch.fx.passes.shape_prop.ShapeProp` with a user-supplied example input, so shapes are optional rather than mandatory.
 
-Known limitation: symbolic tracing fails on data-dependent control flow (`if x.sum() > 0:`). The planned fallback is a second frontend based on `torch.export` (which traces with fake tensors and supports more programs), selected automatically when `symbolic_trace` raises. Both frontends will emit the same IR, so nothing downstream changes.
+Known limitation: symbolic tracing fails on data-dependent control flow (`if x.sum() > 0:`). That case is covered by a second frontend, selected automatically when `symbolic_trace` raises; see below.
+
+### The `torch.export` fallback
+
+Plain `torch.export` does **not** fix data-dependent control flow. It traces with fake tensors, which carry shapes but no values, so `if x.sum() > 0:` hits the same wall fx does — measured on torch 2.13:
+
+| API                                 | `if x.sum() > 0:`                                   |
+| ----------------------------------- | --------------------------------------------------- |
+| `torch.export.export(strict=True)`  | fails — `Unsupported: Data-dependent branching`     |
+| `torch.export.export(strict=False)` | fails — `GuardOnDataDependentSymNode`               |
+| `make_fx(tracing_mode="real")`      | fails — `aten._local_scalar_dense`                  |
+| `torch.export.draft_export`         | works — real-tensor propagation resolves the branch |
+
+Only `draft_export` gets through, by propagating real tensors alongside the fake ones and **specializing** on the example input. That is a real semantic difference, not an implementation detail: the resulting graph describes the branch that one input takes, and a different input can yield a different diagram. `trace()` says so with a `UserWarning` rather than quietly presenting a partial trace as the model.
+
+The frontend therefore tries the sound path first (`export(strict=False)`, no warning when it succeeds) and only then `draft_export`. Soundness is read from `draft_export`'s own report; a missing report is treated as unsound rather than assumed fine.
+
+Three properties of export graphs make this a small module rather than a second tracer:
+
+- **Module identity survives.** Export emits ATen ops, so the naive reading gives `aten.convolution.default` where fx gives `Conv2d`. But `nn_module_stack` is populated on every node, and its last entry is the originating leaf module. Grouping nodes by that path, using fx's own `Tracer.is_leaf_module` predicate to decide what counts as a leaf, reproduces fx's labels exactly. One layer can lower to many ATen ops (`nn.MultiheadAttention` becomes 28), so nodes sharing a leaf path collapse into one box.
+- **Shapes are free.** Every node carries `meta["val"]`, so this frontend needs no `ShapeProp` pass. The `output` node is the exception — export leaves it without `val`, so its shape is read off the node feeding it.
+- **Guard plumbing has a clean signature.** `draft_export` records the specialized condition as `aten.item` / `sym_ite` / `operator.ge` / `aten._assert_scalar` nodes, plus a synthetic `_guards_fn` module. None of them produce tensor data, so one test — is `meta["val"]` a tensor, or a tuple containing one — drops all of it without touching a real node. The tuple case matters for genuinely multi-output ops (`torch.max(dim=...)`, `split`, `topk`).
+
+    Dropping only those leaves a stub, though: the condition the model really did compute (`x.sum() > 0` lowers to `sum` then `gt` then `ne`) is tensor-valued, and once its consumers are gone it trails off the side of the diagram as a dangling chain that corresponds to nothing in the architecture. So the rule extends one step: a node whose consumers were _all_ dropped as plumbing is plumbing too, applied in reverse topological order so one pass clears a whole chain. A node with **no** consumers at all is deliberately kept — that is dead code the model genuinely contains, which the fx frontend draws, and dropping it here would make the two frontends disagree.
+
+The same `nn_module_stack` walk yields `scope`/`scope_class`, so `aggregate_blocks()` works on export graphs unchanged. On models both frontends can trace, they emit byte-identical graphs, which is asserted in the test suite. On a hand-written transformer block, export is in fact tidier: fx keeps Python-level plumbing (`getattr` and `getitem` on the shape tuple, `floordiv`) that export resolves into symbolic shapes, so the same block is 22 nodes instead of 27.
+
+One practical wrinkle: `draft_export`'s real-tensor logging calls `inspect.getsourcelines` on the user frame, so a model defined in a REPL or notebook, where no source file exists, can fail with `OSError`. It is caught with the other export failures, and the original fx error — which describes the model rather than the fallback — is what reaches the user.
 
 ### Why a framework-agnostic IR
 

@@ -2,7 +2,7 @@
 
 ## Tracing a model
 
-`torchdiagram.trace()` accepts any `nn.Module` whose `forward()` can be handled by `torch.fx.symbolic_trace`:
+`torchdiagram.trace()` accepts any `nn.Module` whose `forward()` can be handled by `torch.fx.symbolic_trace`, and falls back to a `torch.export` frontend for the rest:
 
 ```python
 import torchdiagram as td
@@ -40,12 +40,31 @@ The graph name defaults to the model's class name and can be overridden:
 graph = td.trace(model, name="Encoder v2")
 ```
 
-### Tracing limitations
+### Data-dependent control flow
 
-`torch.fx` symbolic tracing executes `forward()` with proxy values, which imposes the standard fx restrictions:
+`torch.fx` symbolic tracing executes `forward()` with proxy values, so it cannot evaluate a branch that depends on tensor values (`if x.sum() > 0:`, loops whose length depends on the data). When that happens, `trace()` falls back to a second frontend built on `torch.export`, which runs the model on the example input and records the branch that input actually takes:
 
-- **Data-dependent control flow** (`if x.sum() > 0:`, loops whose length depends on tensor values) raises a `TraceError`. A fallback frontend based on `torch.export` is planned; see [design.md](design.md).
-- **Non-tensor containers with dynamic contents** and some dynamic Python features inside `forward()` may not be traceable.
+```python
+graph = td.trace(model, torch.randn(1, 3, 224, 224))
+# UserWarning: ... specialized on the example input: branches not taken by this input
+# are absent from the diagram
+```
+
+The warning matters: the resulting diagram is a **specialization**, not a complete picture of the model. Branches the example input does not take are missing, and a different input can produce a different diagram. Choose an example input that exercises the path you want to publish.
+
+The fallback needs an example input, since `torch.export` traces by running the model. Calling `td.trace(model)` on an untraceable model with no example input raises `TraceError` with a hint to supply one.
+
+Both frontends emit the same IR, so shapes, `scope`, `aggregate_blocks()`, and every renderer behave identically either way. On a model both can trace, they produce identical graphs. Pin one with `backend=`:
+
+```python
+graph = td.trace(model, example_input, backend="fx")  # never fall back
+graph = td.trace(model, example_input, backend="export")  # skip fx entirely
+```
+
+### Other tracing limitations
+
+- **Non-tensor containers with dynamic contents** and some dynamic Python features inside `forward()` may not be traceable by either frontend.
+- A model the `torch.export` frontend also cannot handle surfaces the original `TraceError` from fx, since that error describes the model rather than the fallback.
 
 Models that are fully defined in terms of submodule calls, tensor functions, and tensor methods — which covers most convolutional and transformer architectures — trace without modification.
 

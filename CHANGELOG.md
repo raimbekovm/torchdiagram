@@ -7,6 +7,7 @@ All notable changes to this project are documented here. The format follows [Kee
 ### Added
 
 - `torchdiagram.trace()`: trace any fx-traceable `nn.Module` (residuals, branches, functional ops) into a framework-agnostic graph IR, with optional output-shape annotation from an example input.
+- `torch.export` fallback frontend for models `torch.fx` cannot trace, such as those with data-dependent control flow. Selected automatically when symbolic tracing fails, or pinned with `trace(..., backend="export")` and `--backend`. The fallback specializes on the example input and warns that untaken branches are absent from the diagram; both frontends emit the same IR.
 - SVG renderer with curved routing for skip/residual edges.
 - TikZ renderer producing a standalone compilable LaTeX document.
 - `torchdiagram.render()` dispatching on output file extension (`.svg`, `.tex`, `.tikz`).

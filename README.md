@@ -6,7 +6,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://github.com/raimbekovm/torchdiagram/blob/main/pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/raimbekovm/torchdiagram/blob/main/LICENSE)
 
-torchdiagram traces an `nn.Module` with `torch.fx` and renders the resulting computation graph as a block diagram. Because the diagram is derived from the traced `forward()`, it reflects the actual data flow of the model — including residual connections, parallel branches, and functional ops — rather than a manually maintained description of it.
+torchdiagram traces an `nn.Module` with `torch.fx` and renders the resulting computation graph as a block diagram. Because the diagram is derived from the traced `forward()`, it reflects the actual data flow of the model — including residual connections, parallel branches, and functional ops — rather than a manually maintained description of it. Models that `torch.fx` cannot trace, such as those branching on tensor values, fall back to a `torch.export` frontend automatically.
 
 Two output formats are supported:
 
@@ -70,7 +70,7 @@ Requires Python 3.10+ and PyTorch 2.0+.
 ## How it works
 
 ```text
-nn.Module ──▶ torch.fx trace ──▶ framework-agnostic IR ──▶ SVG / TikZ renderer
+nn.Module ──▶ torch.fx trace (or torch.export) ──▶ framework-agnostic IR ──▶ SVG / TikZ renderer
 ```
 
 The tracer converts the fx graph into a small intermediate representation (`Graph` / `Node` / `Edge` dataclasses with no torch dependency). Renderers are pure functions over that IR, so traced graphs can be inspected or edited before rendering, and graphs can also be built by hand.
@@ -87,11 +87,11 @@ Pre-alpha. The core pipeline works end-to-end:
 - [x] Block aggregation — collapse repeated layers so deep networks render compactly
 - [x] Presets for attention/transformer blocks
 - [x] Styling/theme API
-- [ ] Fallback tracer for data-dependent control flow (`torch.export`)
+- [x] Fallback tracer for data-dependent control flow (`torch.export`)
 - [ ] PNG export
 - [ ] PyPI release
 
-**Known limitation:** `torch.fx` symbolic tracing cannot handle data-dependent control flow (e.g. `if x.sum() > 0:` inside `forward()`). This is the standard fx restriction; a fallback tracer is on the roadmap.
+**Known limitation:** a model that branches on tensor values (`if x.sum() > 0:`) is traced by the `torch.export` fallback, which specializes on the example input. The diagram then shows the branch that input takes and omits the others, and `trace()` warns when this happens.
 
 ## FAQ
 
@@ -105,7 +105,7 @@ No. `torch.fx` symbolic tracing and shape propagation both run on CPU tensors; t
 Yes. Because the diagram comes from a real `torch.fx` trace of `forward()`, residual connections, parallel branches, and functional ops (`torch.relu`, `x + y`, `x.view(...)`) are captured as part of the graph rather than requiring manual annotation.
 
 **What happens if my model has data-dependent control flow (`if x.sum() > 0:`)?**
-`trace()` raises `torch.fx.proxy.TraceError`, since symbolic tracing cannot execute a branch that depends on tensor values rather than static shape. A fallback frontend based on `torch.export` is planned to cover this case.
+`trace()` falls back to a second frontend built on `torch.export`, which runs the model on the example input and records the branch that input actually takes. The diagram is therefore a specialization: branches the input does not take are absent, and `trace()` emits a warning saying so. This fallback needs an example input, since `torch.export` traces by running the model. Both frontends emit the same IR, so shapes, block aggregation, and every renderer behave identically either way.
 
 **Can I edit the diagram after generating it?**
 Yes, at two levels: the intermediate `Graph` returned by `trace()` is a plain dataclass you can modify (rename labels, drop nodes) before rendering, and the rendered SVG is editable in any vector graphics editor while the TikZ output is plain LaTeX you can edit directly.

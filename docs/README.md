@@ -16,7 +16,7 @@ torchdiagram generates architecture block diagrams directly from PyTorch models.
 
 The library consists of three parts:
 
-1. **Tracer** (`torchdiagram.trace`) — symbolically traces a model's `forward()` with `torch.fx` and emits a graph of layers, function calls, and data-flow edges. Residual connections, parallel branches, and functional ops are captured as part of the trace. An optional example input enables output-shape annotation on every node.
+1. **Tracer** (`torchdiagram.trace`) — symbolically traces a model's `forward()` with `torch.fx` and emits a graph of layers, function calls, and data-flow edges. Residual connections, parallel branches, and functional ops are captured as part of the trace. An optional example input enables output-shape annotation on every node. Models `torch.fx` cannot trace, such as those branching on tensor values, fall back to a `torch.export` frontend that emits the same graph.
 2. **Intermediate representation** (`torchdiagram.graph`) — plain dataclasses (`Graph`, `Node`, `Edge`) with no torch dependency. Traced graphs can be inspected and edited before rendering, and graphs can also be constructed by hand.
 3. **Renderers** (`torchdiagram.renderers`) — pure functions from a `Graph` to a string. Two formats are provided: SVG (self-contained, viewable in any browser or editor) and TikZ (a standalone LaTeX document suitable for publications). Producing either format requires no LaTeX toolchain.
 

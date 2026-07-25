@@ -11,17 +11,20 @@ td.render(graph, "model.svg")
 
 ## Functions
 
-### `td.trace(model, example_input=None, *, name=None) -> Graph`
+### `td.trace(model, example_input=None, *, name=None, backend="auto") -> Graph`
 
 Trace a PyTorch module into a renderable graph.
 
-| Parameter       | Type                   | Description                                                                             |
-| --------------- | ---------------------- | --------------------------------------------------------------------------------------- |
-| `model`         | `nn.Module`            | Module to trace. `forward()` may be arbitrary fx-traceable code.                        |
-| `example_input` | `torch.Tensor \| None` | When given, a forward pass is shape-propagated and every node carries its output shape. |
-| `name`          | `str \| None`          | Diagram title. Defaults to the model's class name.                                      |
+| Parameter       | Type                   | Description                                                                                                                                  |
+| --------------- | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`         | `nn.Module`            | Module to trace. `forward()` may be arbitrary fx-traceable code, or need the `torch.export` frontend.                                        |
+| `example_input` | `torch.Tensor \| None` | When given, a forward pass is shape-propagated and every node carries its output shape. Required by the `torch.export` frontend.             |
+| `name`          | `str \| None`          | Diagram title. Defaults to the model's class name.                                                                                           |
+| `backend`       | `str`                  | Tracing frontend: `"auto"` (default) uses `torch.fx` and falls back to `torch.export`, `"fx"` and `"export"` pin one. Both emit the same IR. |
 
-Raises `torch.fx.proxy.TraceError` (and related fx exceptions) when the model is not symbolically traceable; see [tracing limitations](usage.md#tracing-limitations).
+Raises `torch.fx.proxy.TraceError` when no frontend can trace the model, and `ValueError` for an unknown `backend` or for `backend="export"` without an `example_input`.
+
+Warns with `UserWarning` when the `torch.export` frontend had to specialize the graph on `example_input`, meaning branches that input does not take are absent from the diagram; see [data-dependent control flow](usage.md#data-dependent-control-flow).
 
 ### `td.render(graph, path, *, theme=DEFAULT) -> Path`
 
