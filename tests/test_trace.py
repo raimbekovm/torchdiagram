@@ -10,6 +10,7 @@ from tests.models import (
     ComposedEncoder,
     CroppedHead,
     DualEncoder,
+    FixedRange,
     GatedNet,
     NamedOutput,
     NestedReturn,
@@ -202,6 +203,7 @@ def test_single_return_keeps_one_plain_output_node():
         (CroppedHead(), torch.randn(1, 3, 5)),
         (ChainedSubscript(), torch.randn(3, 4, 4)),
         (SteppedSubscripts(), torch.randn(3, 4, 4)),
+        (ShapeMath(), torch.randn(1, 8, 4)),
     ],
 )
 def test_both_frontends_emit_the_same_ir(model, example):
@@ -420,3 +422,24 @@ def test_a_subscript_feeding_two_readers_is_not_collapsed():
 
     graph = td.trace(Fanout(), torch.randn(3, 4, 4), backend="fx")
     assert [node.op for node in graph.nodes].count("index") == 3
+
+
+def test_a_range_sized_by_the_input_depends_on_it_in_both_frontends():
+    """Export folds `x.shape[1]` into a constant, so the dependency is recovered rather than read off the graph."""
+    example = torch.randn(1, 8, 4)
+    for backend in ("fx", "export"):
+        graph = td.trace(ShapeMath(), example, backend=backend)
+        source = next(node for node in graph.nodes if node.op == "input")
+        arange = next(node for node in graph.nodes if node.op == "arange")
+        assert td.Edge(source.id, arange.id) in graph.edges, backend
+
+
+def test_a_range_of_a_fixed_size_is_left_unconnected():
+    """The recovery reports what the model reads a size from, and a hardcoded length reads nothing.
+
+    Asked of the export frontend only: fx constant-folds a range with no traced input into a tensor attribute before
+    the frontend ever sees it, so there is no range node there to ask about.
+    """
+    graph = td.trace(FixedRange(), torch.randn(1, 8, 4), backend="export")
+    arange = next(node for node in graph.nodes if node.op == "arange")
+    assert [edge for edge in graph.edges if edge.target == arange.id] == []

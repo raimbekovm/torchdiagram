@@ -579,3 +579,17 @@ class SteppedSubscripts(nn.Module):
         group = x[0]
         slot = group[1]
         return self.proj(slot)
+
+
+class FixedRange(nn.Module):
+    """Builds a range of a fixed size, owing nothing to its input — the constant a recovered shape read is not."""
+
+    def __init__(self) -> None:
+        """Initialize the position embedding and the output projection."""
+        super().__init__()
+        self.pos = nn.Embedding(16, 4)
+        self.proj = nn.Linear(4, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Add a position embedding of a fixed length, then project."""
+        return self.proj(x + self.pos(torch.arange(8)))

@@ -37,13 +37,16 @@ from .frontend import (
     result_keys,
     unique_id,
 )
-from .graph import Graph, Node
+from .graph import Edge, Graph, Node
 
 # Export narrates a failed attempt loudly: draft_export logs a tlparse banner about unsound specialization, and
 # torch.export._trace prints the partial graph straight to stderr with no logger in between. Both are noise here —
 # a failed attempt is the expected path for the models this frontend exists to handle — so _quiet_export() suppresses
 # them and trace_export() says the one thing that matters in a single warning.
 _LOG_PREFIX = "torch"
+
+# Node kinds that legitimately have nothing feeding them, so a missing incoming edge is not a symptom.
+_UNFED = frozenset({"input", "parameter", "buffer"})
 
 _Entries = list[tuple[str, str, object]]
 """A node's ``nn_module_stack`` as ``(call key, submodule path, class)`` triples, outermost first.
@@ -81,7 +84,7 @@ def trace_export(model: nn.Module, example_input: ExampleInput, *, name: str | N
             UserWarning,
             stacklevel=2,
         )
-    return _build_graph(model, graph_module, name=name or type(model).__name__)
+    return _build_graph(model, graph_module, as_args(example_input), name=name or type(model).__name__)
 
 
 def _export(model: nn.Module, args: tuple[torch.Tensor, ...]) -> tuple[torch.fx.GraphModule, bool]:
@@ -142,12 +145,15 @@ def _quiet_export() -> Iterator[None]:
             handler.removeFilter(_drop)
 
 
-def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: str) -> Graph:
+def _build_graph(
+    model: nn.Module, graph_module: torch.fx.GraphModule, args: tuple[torch.Tensor, ...], *, name: str
+) -> Graph:
     """Convert an exported graph module into the IR.
 
     Args:
         model: The original module, used to resolve submodules by the paths recorded in ``nn_module_stack``.
         graph_module: Result of ``ExportedProgram.module()``.
+        args: The example arguments the model was exported with, for re-exporting if a shape read has to be recovered.
         name: Diagram title.
 
     Returns:
@@ -163,6 +169,8 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
     plumbing = _plumbing(graph_module)
     pending = _direct_parameters(model, graph_module, plumbing)  # parameter boxes, held back until first consumed
     indexing: dict[torch.fx.Node, Node] = {}  # indexing ops, mapped to the box the whole subscript draws as
+    origin: dict[str, torch.fx.Node] = {}  # IR node id -> the ATen op it was built from, for recovering shape reads
+    inputs: dict[str, str] = {}  # placeholder name -> IR node id, the other half of the same recovery
     results: list[tuple[str | None, torch.fx.Node]] = []
 
     for fx_node in graph_module.graph.nodes:
@@ -172,6 +180,7 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
             continue
         if fx_node.op == "placeholder":
             node = Node(id=unique_id(fx_node.name, used_ids), op="input", label="input", output_shape=_shape(fx_node))
+            inputs[fx_node.name] = node.id
         elif fx_node.op != "call_function" or fx_node in plumbing:
             continue  # a layer's own weights, the synthetic _guards_fn module, and symbolic guard assertions
         else:
@@ -227,6 +236,7 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
                 owner[upstream] = parameter.id
                 graph.nodes.append(parameter)
         owner[fx_node] = node.id
+        origin.setdefault(node.id, fx_node)
         graph.nodes.append(node)
 
     for node_id, run in members.items():
@@ -234,8 +244,106 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
 
     qualify_labels(graph.nodes, paths)
     graph.edges = build_edges(owner)
+    _reconnect_shape_reads(model, args, graph, origin, inputs)
     append_outputs(graph, owner, results, _shape, used_ids)
     return graph
+
+
+def _reconnect_shape_reads(
+    model: nn.Module,
+    args: tuple[torch.Tensor, ...],
+    graph: Graph,
+    origin: dict[str, torch.fx.Node],
+    inputs: dict[str, str],
+) -> None:
+    """Draw the edge into an op whose only input was a tensor's size, which export resolved to a constant.
+
+    ``torch.arange(idx.shape[1])`` really is sized by the input, and fx draws it that way: it records the shape read as
+    nodes, and the edge rebuilder reconnects across them. Export evaluates the same expression at trace time, so the
+    ATen graph holds ``arange(16)`` with nothing linking it to the placeholder, and the box floats with no arrow at all.
+
+    The dependency is recoverable, just not from this graph: exporting again with the input's dimensions marked dynamic
+    leaves the read standing as a ``sym_size`` node, which names the placeholder it came from. That second export costs
+    as much as the first, so it is attempted only for a node that actually floats — which across the sixteen reference
+    architectures means one model, and no cost at all for the other fifteen. If it fails, or if the graphs cannot be
+    matched up, the diagram is left as it was.
+
+    Args:
+        model: The module being traced.
+        args: The example arguments it was exported with.
+        graph: The graph so far, its edges already built. Modified in place.
+        origin: IR node id mapped to the ATen op it was built from.
+        inputs: Placeholder name mapped to the id of the input node drawn for it.
+    """
+    fed = {edge.target for edge in graph.edges}
+    floating = [node for node in graph.nodes if node.op not in _UNFED and node.id not in fed and node.id in origin]
+    if not floating:
+        return
+    dynamic = _export_dynamic(model, args)
+    if dynamic is None:
+        return
+    by_identity = {(fx_node.name, str(fx_node.target)): fx_node for fx_node in dynamic.graph.nodes}
+    for node in floating:
+        source = origin[node.id]
+        match = by_identity.get((source.name, str(source.target)))
+        if match is None:  # the two exports disagree about this node, so there is nothing safe to say about it
+            continue
+        for placeholder in _shape_sources(match):
+            if placeholder in inputs:
+                graph.edges.append(Edge(source=inputs[placeholder], target=node.id))
+
+
+def _export_dynamic(model: nn.Module, args: tuple[torch.Tensor, ...]) -> torch.fx.GraphModule | None:
+    """Export ``model`` with every input dimension left dynamic, so shape reads survive as nodes.
+
+    ``Dim.AUTO`` specializes back any dimension the model turns out to require a fixed value for, so this is the sound
+    export with as little constant folding as torch will agree to — not a claim that the model is shape-generic.
+
+    Args:
+        model: The module being traced.
+        args: The example arguments it was exported with.
+
+    Returns:
+        The exported graph module, or ``None`` if the torch build has no ``Dim.AUTO`` or the export failed.
+    """
+    auto = getattr(getattr(torch.export, "Dim", None), "AUTO", None)
+    if auto is None:  # torch too old to ask for automatic dynamism
+        return None
+    spec = tuple({axis: auto for axis in range(tensor.dim())} for tensor in args)
+    try:
+        with _quiet_export(), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return torch.export.export(model, args, dynamic_shapes=spec, strict=False).module()
+    except Exception:
+        return None
+
+
+def _shape_sources(fx_node: torch.fx.Node) -> list[str]:
+    """The placeholders ``fx_node`` reads a size from, found by walking up through symbolic-size nodes only.
+
+    Stopping at the first tensor-valued node is what keeps this to shape reads: a tensor input would already be an edge
+    in the graph built from the first export, and the node would not have been floating.
+
+    Args:
+        fx_node: A node in the dynamically exported graph.
+
+    Returns:
+        Placeholder names, in the order reached.
+    """
+    found: list[str] = []
+    visited: set[torch.fx.Node] = set()
+    queue = list(fx_node.all_input_nodes)
+    while queue:
+        upstream = queue.pop(0)
+        if upstream in visited:
+            continue
+        visited.add(upstream)
+        if upstream.op == "placeholder":
+            if upstream.name not in found:
+                found.append(upstream.name)
+        elif not _is_tensor_valued(upstream.meta.get("val")):
+            queue.extend(upstream.all_input_nodes)
+    return found
 
 
 def _direct_parameters(
