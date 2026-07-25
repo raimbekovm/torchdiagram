@@ -22,18 +22,27 @@ import torch
 import torch.fx
 from torch import nn
 
-from .frontend import ExampleInput, append_outputs, as_args, build_edges, qualify_labels, result_keys
+from .frontend import (
+    LEAF_PROBE,
+    ExampleInput,
+    append_outputs,
+    as_args,
+    build_edges,
+    normalize_label,
+    qualify_labels,
+    result_keys,
+    unique_id,
+)
 from .graph import Graph, Node
-
-# fx's own leaf-module rule ("a torch.nn built-in that isn't a Sequential"), reused verbatim so that both frontends
-# draw the same box for the same layer instead of each inventing its own notion of a leaf.
-_LEAF_PROBE = torch.fx.Tracer()
 
 # Export narrates a failed attempt loudly: draft_export logs a tlparse banner about unsound specialization, and
 # torch.export._trace prints the partial graph straight to stderr with no logger in between. Both are noise here —
 # a failed attempt is the expected path for the models this frontend exists to handle — so _quiet_export() suppresses
 # them and trace_export() says the one thing that matters in a single warning.
 _LOG_PREFIX = "torch"
+
+_Entries = list[tuple[str, object]]
+"""A node's ``nn_module_stack`` as ``(submodule path, class)`` pairs, outermost first."""
 
 
 def trace_export(model: nn.Module, example_input: ExampleInput, *, name: str | None = None) -> Graph:
@@ -143,6 +152,7 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
     used_ids: set[str] = set()
     paths: dict[str, str] = {}  # IR node id mapped to the submodule it came from, for label disambiguation
     plumbing = _plumbing(graph_module)
+    indexing: dict[torch.fx.Node, Node] = {}  # indexing ops, mapped to the box the whole subscript draws as
     results: list[tuple[str | None, torch.fx.Node]] = []
 
     for fx_node in graph_module.graph.nodes:
@@ -150,23 +160,32 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
             results = _results(graph_module, fx_node)
             continue
         if fx_node.op == "placeholder":
-            node = Node(id=_unique(fx_node.name, used_ids), op="input", label="input", output_shape=_shape(fx_node))
+            node = Node(id=unique_id(fx_node.name, used_ids), op="input", label="input", output_shape=_shape(fx_node))
         elif fx_node.op != "call_function" or fx_node in plumbing:
             continue  # get_attr parameter plumbing, the synthetic _guards_fn module, and symbolic guard assertions
         else:
-            entries = _stack(fx_node)
-            path, module = _leaf_module(model, entries)
+            path, module, ancestors = _leaf_module(model, _stack(fx_node))
             if module is None:
                 label = _label(fx_node.target)
-                scope, scope_class = _scope(entries)
+                continued = _continues_subscript(fx_node, label, indexing)
+                if continued is not None:
+                    owner[fx_node] = continued.id
+                    continued.output_shape = _shape(fx_node)
+                    indexing[fx_node] = continued
+                    continue
+                scope, scope_class = _scope(ancestors)
                 node = Node(
-                    id=_unique(fx_node.name, used_ids),
+                    # Numbered off the normalized label rather than off export's own node name, which is derived from
+                    # the ATen overload and so would read `slice_1` where fx reads `index`.
+                    id=unique_id(label, used_ids),
                     op=label,
                     label=label,
                     output_shape=_shape(fx_node),
                     scope=scope,
                     scope_class=scope_class,
                 )
+                if label == "index":
+                    indexing[fx_node] = node
             elif path in by_module:
                 # A single layer can lower to several ATen ops (nn.MultiheadAttention becomes 28 of them); they all
                 # belong to one box, and the group's output is whichever op runs last.
@@ -177,9 +196,9 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
             else:
                 kind = type(module).__name__
                 extra = module.extra_repr()
-                scope, scope_class = _scope(entries[:-1])  # a layer reports the container holding it, not itself
+                scope, scope_class = _scope(ancestors)  # a layer reports the container holding it, not itself
                 node = Node(
-                    id=_unique(path.replace(".", "_"), used_ids),
+                    id=unique_id(path.replace(".", "_"), used_ids),
                     op=kind.lower(),
                     label=kind,
                     params={"config": extra} if extra else {},
@@ -247,30 +266,62 @@ def _out_structure(spec: object) -> tuple[str | None, list[str] | None]:
     return None, None
 
 
-def _leaf_module(model: nn.Module, entries: list[tuple[str, object]]) -> tuple[str, nn.Module | None]:
+def _continues_subscript(fx_node: torch.fx.Node, label: str, indexing: dict[torch.fx.Node, Node]) -> Node | None:
+    """The box ``fx_node`` belongs to when it is another step of a subscript already being drawn.
+
+    ``x[:, 0, :-1]`` is one expression to a reader and one node to fx, but export lowers it per axis — a ``select`` and
+    then a ``slice``. Consecutive indexing ops that came from the same source line and feed nothing but each other are
+    that one expression, so they fold back into a single box. Two subscripts written on separate lines keep a box each,
+    which is what fx draws for them too.
+
+    Args:
+        fx_node: The node being converted.
+        label: Its normalized label.
+        indexing: Indexing nodes seen so far, mapped to the box each is drawn as.
+
+    Returns:
+        The box to extend, or ``None`` when this node starts one of its own.
+    """
+    if label != "index" or len(fx_node.all_input_nodes) != 1:
+        return None
+    source = fx_node.all_input_nodes[0]
+    if source not in indexing or len(source.users) != 1:
+        return None
+    line = fx_node.meta.get("stack_trace")
+    return indexing[source] if line is not None and line == source.meta.get("stack_trace") else None
+
+
+def _leaf_module(model: nn.Module, entries: _Entries) -> tuple[str, nn.Module | None, _Entries]:
     """Resolve the leaf ``nn.Module`` a node was lowered from, if it was lowered from one.
+
+    The stack is walked **outermost-first**, which is the direction fx applies the same predicate while tracing: the
+    first leaf on the path stops the descent and nothing inside it is ever visited. Asking about the innermost entry
+    instead makes every torch.nn descendant of a torch.nn composite qualify on its own, so an
+    ``nn.TransformerEncoderLayer`` gets drawn as one box *and* as its nine children, and the two frontends disagree
+    about a model neither had trouble tracing.
 
     When the node came from functional code instead, the returned path is still the innermost recorded one, which is
     what scope resolution needs.
 
     Args:
         model: The original module, whose submodule paths ``nn_module_stack`` refers to.
-        entries: The node's ``nn_module_stack`` entries.
+        entries: The node's ``nn_module_stack`` entries, outermost first.
 
     Returns:
-        A ``(path, module)`` pair; ``module`` is ``None`` when the node came from functional code, not a leaf layer.
+        A ``(path, module, ancestors)`` triple; ``module`` is ``None`` when the node came from functional code rather:
+            than a leaf layer, and ``ancestors`` is the entries above the resolved one, for scope resolution.
     """
-    if not entries:
-        return "", None
-    path = entries[-1][0]
-    try:
-        module = model.get_submodule(path)
-    except AttributeError:  # a path export synthesized that the original model doesn't have
-        return path, None
-    return path, module if _LEAF_PROBE.is_leaf_module(module, path) else None
+    for index, (path, _) in enumerate(entries):
+        try:
+            module = model.get_submodule(path)
+        except AttributeError:  # a path export synthesized that the original model doesn't have
+            continue
+        if LEAF_PROBE.is_leaf_module(module, path):
+            return path, module, entries[:index]
+    return (entries[-1][0] if entries else ""), None, entries
 
 
-def _scope(entries: list[tuple[str, object]]) -> tuple[str | None, str | None]:
+def _scope(entries: _Entries) -> tuple[str | None, str | None]:
     """Resolve the immediate custom-container ancestor from ``nn_module_stack`` entries, as the fx frontend does.
 
     Args:
@@ -287,7 +338,7 @@ def _scope(entries: list[tuple[str, object]]) -> tuple[str | None, str | None]:
     return path, cls.rsplit(".", 1)[-1] if isinstance(cls, str) else getattr(cls, "__name__", str(cls))
 
 
-def _stack(fx_node: torch.fx.Node) -> list[tuple[str, object]]:
+def _stack(fx_node: torch.fx.Node) -> _Entries:
     """Read ``nn_module_stack`` as ``(path, class)`` entries, dropping the root module fx never records."""
     stack = fx_node.meta.get("nn_module_stack")
     return [entry for entry in stack.values() if entry[0]] if stack else []
@@ -296,7 +347,7 @@ def _stack(fx_node: torch.fx.Node) -> list[tuple[str, object]]:
 def _label(target: object) -> str:
     """Name a functional node the way the fx frontend would, e.g. ``aten.relu.default`` becomes ``"relu"``."""
     name = getattr(target, "__name__", None) or str(target)
-    return name.split(".")[0]  # ATen overloads report as "relu.default" / "flatten.using_ints"
+    return normalize_label(name.split(".")[0])  # ATen overloads report as "relu.default" / "flatten.using_ints"
 
 
 def _plumbing(graph_module: torch.fx.GraphModule) -> set[torch.fx.Node]:
@@ -357,14 +408,3 @@ def _shape(fx_node: torch.fx.Node) -> tuple[int, ...] | None:
         return tuple(int(dim) for dim in val.shape)
     except TypeError:  # a symbolic dimension, which has no single integer value
         return None
-
-
-def _unique(candidate: str, used: set[str]) -> str:
-    """Return ``candidate``, suffixed if needed, so node ids stay unique across both naming schemes."""
-    node_id = candidate
-    suffix = 1
-    while node_id in used:
-        node_id = f"{candidate}_{suffix}"
-        suffix += 1
-    used.add(node_id)
-    return node_id

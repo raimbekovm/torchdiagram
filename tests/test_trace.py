@@ -2,9 +2,12 @@
 
 import pytest
 import torch
+from torch import nn
 
 import torchdiagram as td
 from tests.models import (
+    ComposedEncoder,
+    CroppedHead,
     DualEncoder,
     GatedNet,
     PyramidHeads,
@@ -181,6 +184,8 @@ def test_single_return_keeps_one_plain_output_node():
         (UnusedBranch(), torch.randn(1, 4)),
         (DualEncoder(), (torch.randn(1, 4), torch.randn(1, 8))),
         (PyramidHeads(), torch.randn(1, 3, 8, 8)),
+        (ComposedEncoder(), torch.randn(1, 5, 8)),
+        (CroppedHead(), torch.randn(1, 3, 5)),
     ],
 )
 def test_both_frontends_emit_the_same_ir(model, example):
@@ -196,6 +201,42 @@ def test_both_frontends_emit_the_same_ir(model, example):
 
     assert fields(by_fx) == fields(by_export)
     assert sorted((e.source, e.target) for e in by_fx.edges) == sorted((e.source, e.target) for e in by_export.edges)
+
+
+def test_torch_composite_layer_draws_one_box_in_both_frontends():
+    """A torch.nn composite is a leaf to both frontends: one box, not a box plus its nine children."""
+    example = torch.randn(1, 5, 8)
+    for backend in ("fx", "export"):
+        labels = [node.label for node in td.trace(ComposedEncoder(), example, backend=backend).nodes]
+        assert sum(label.startswith("TransformerEncoderLayer") for label in labels) == 2
+        # The children of an encoder layer are only ever drawn if the descent didn't stop at the layer itself.
+        assert "MultiheadAttention" not in labels
+
+
+def test_subscripting_a_tensor_gets_one_label_from_both_frontends():
+    """`x[:, 0, :-1]` is one operation to a reader, whichever way the tracer lowered it."""
+    example = torch.randn(1, 3, 5)
+    for backend in ("fx", "export"):
+        ops = [node.op for node in td.trace(CroppedHead(), example, backend=backend).nodes]
+        assert "index" in ops
+        assert "getitem" not in ops
+        assert "slice" not in ops
+
+
+def test_a_leaf_layer_traced_on_its_own_keeps_its_class_and_config():
+    """Pointing the tool at a bare layer draws that layer, not the functional ops fx descends into."""
+    graph = td.trace(nn.Linear(4, 6), torch.randn(1, 4))
+    graph.validate()
+    layer = graph.nodes[1]
+    assert layer.label == "Linear"
+    assert "in_features=4" in layer.params["config"]
+    assert [node.output_shape for node in graph.nodes] == [(1, 4), (1, 6), (1, 6)]
+
+
+def test_a_leaf_layer_traced_on_its_own_needs_no_example_input():
+    """The layer box is drawn from the module itself, so it works without shapes, like every other model."""
+    labels = [node.label for node in td.trace(nn.Conv2d(1, 8, 3)).nodes]
+    assert labels == ["input", "Conv2d", "output"]
 
 
 def test_export_graphs_still_aggregate():

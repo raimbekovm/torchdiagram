@@ -16,7 +16,18 @@ from torch import nn
 from torch.fx.passes.shape_prop import ShapeProp
 
 from .export_trace import trace_export
-from .frontend import ExampleInput, append_outputs, as_args, build_edges, qualify_labels, result_keys
+from .frontend import (
+    LEAF_PROBE,
+    ExampleInput,
+    append_outputs,
+    as_args,
+    build_edges,
+    leaf_root_graph,
+    normalize_label,
+    qualify_labels,
+    result_keys,
+    unique_id,
+)
 from .graph import Graph, Node
 
 BACKENDS = ("auto", "fx", "export")
@@ -66,6 +77,8 @@ def trace(
     if backend not in BACKENDS:
         raise ValueError(f"unknown backend {backend!r} (expected one of: {', '.join(BACKENDS)})")
     args = None if example_input is None else as_args(example_input)
+    if LEAF_PROBE.is_leaf_module(model, ""):
+        return leaf_root_graph(model, args, name=name or type(model).__name__)
     if backend == "export":
         if args is None:
             raise ValueError("backend='export' requires an example input, since torch.export traces with real inputs")
@@ -110,6 +123,7 @@ def _trace_fx(model: nn.Module, args: tuple[torch.Tensor, ...] | None, *, name: 
     owner: dict[torch.fx.Node, str] = {}
     paths: dict[str, str] = {}
     plumbing = _plumbing(graph_module)
+    used_ids: set[str] = set()
     results: list[tuple[str | None, torch.fx.Node]] = []
     for fx_node in graph_module.graph.nodes:
         if fx_node in plumbing:
@@ -117,7 +131,7 @@ def _trace_fx(model: nn.Module, args: tuple[torch.Tensor, ...] | None, *, name: 
         if fx_node.op == "output":
             results = _results(fx_node)
             continue
-        node = _to_ir(fx_node, graph_module)
+        node = _to_ir(fx_node, graph_module, used_ids)
         if node is None:
             continue
         if fx_node.op == "call_module":
@@ -196,17 +210,20 @@ def _computes_on(plumbing: set[torch.fx.Node], fx_node: torch.fx.Node) -> bool:
     return bool(inputs) and all(upstream in plumbing for upstream in inputs)
 
 
-def _to_ir(fx_node: torch.fx.Node, graph_module: torch.fx.GraphModule) -> Node | None:
+def _to_ir(fx_node: torch.fx.Node, graph_module: torch.fx.GraphModule, used_ids: set[str]) -> Node | None:
     """Convert a single fx node into an IR ``Node``, or ``None`` if it carries no diagram content.
 
     Args:
         fx_node: Node from the traced fx graph.
         graph_module: The graph module ``fx_node`` belongs to, used to resolve submodules.
+        used_ids: Ids already handed out, so a functional node can be numbered off its normalized name rather than off
+            the tracer's own — which is what keeps the two frontends' ids matching once a name is normalized.
 
     Returns:
         The corresponding IR node, or ``None`` for ``get_attr`` nodes (parameter/buffer plumbing).
     """
     extra = ""  # only a leaf layer has hyperparameters to record
+    node_id = fx_node.name
     if fx_node.op == "placeholder":
         op = label = "input"
     elif fx_node.op == "call_module":
@@ -215,15 +232,18 @@ def _to_ir(fx_node: torch.fx.Node, graph_module: torch.fx.GraphModule) -> Node |
         op = label.lower()
         extra = module.extra_repr()
     elif fx_node.op == "call_function":
-        op = label = getattr(fx_node.target, "__name__", str(fx_node.target))
+        op = label = normalize_label(getattr(fx_node.target, "__name__", str(fx_node.target)))
+        node_id = unique_id(op, used_ids)
     elif fx_node.op == "call_method":
-        op = label = str(fx_node.target)
+        op = label = normalize_label(str(fx_node.target))
+        node_id = unique_id(op, used_ids)
     else:
         return None  # get_attr: parameter/buffer plumbing, not a diagram block
 
+    used_ids.add(node_id)
     scope, scope_class = _scope(fx_node)
     return Node(
-        id=fx_node.name,
+        id=node_id,
         op=op,
         label=label,
         params={"config": extra} if extra else {},

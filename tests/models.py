@@ -266,6 +266,39 @@ class UnusedBranch(nn.Module):
         return self.used(x)
 
 
+class ComposedEncoder(nn.Module):
+    """Built out of torch's own composite layers rather than hand-written blocks.
+
+    ``nn.TransformerEncoderLayer`` is a leaf to fx and a stack of nine children to a naive reading of an export graph,
+    which is the shape on which the two frontends stopped agreeing.
+    """
+
+    def __init__(self, num_blocks: int = 2) -> None:
+        """Initialize the input projection and the stack of encoder layers."""
+        super().__init__()
+        self.proj = nn.Linear(8, 8)
+        self.blocks = nn.Sequential(
+            *[nn.TransformerEncoderLayer(8, 2, 16, batch_first=True) for _ in range(num_blocks)]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Project, then run the encoder stack."""
+        return self.blocks(self.proj(x))
+
+
+class CroppedHead(nn.Module):
+    """Subscripts its input before projecting — one Python expression each tracer lowers its own way."""
+
+    def __init__(self) -> None:
+        """Initialize the projection."""
+        super().__init__()
+        self.proj = nn.Linear(4, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Take the first position, drop its last feature, and project."""
+        return self.proj(x[:, 0, :-1])
+
+
 class DualEncoder(nn.Module):
     """Two towers scored against each other — a model whose ``forward()`` takes more than one tensor."""
 
