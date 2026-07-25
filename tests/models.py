@@ -299,6 +299,34 @@ class CroppedHead(nn.Module):
         return self.proj(x[:, 0, :-1])
 
 
+class SequenceTagger(nn.Module):
+    """A recurrent tagger — a layer returning ``(output, state)``, where only the output is used."""
+
+    def __init__(self) -> None:
+        """Initialize the recurrent layer and the classifier head."""
+        super().__init__()
+        self.rnn = nn.LSTM(4, 6, num_layers=2, batch_first=True, bidirectional=True)
+        self.fc = nn.Linear(12, 3)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the sequence through the recurrent layer and classify every position."""
+        out, _ = self.rnn(x)
+        return self.fc(out)
+
+
+class SubscriptedLayer(nn.Module):
+    """Subscripts a layer that returns a plain tensor — indexing, not the tuple unpacking it looks like."""
+
+    def __init__(self) -> None:
+        """Initialize the convolution."""
+        super().__init__()
+        self.conv = nn.Conv2d(3, 4, kernel_size=3, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Convolve, then take the first item of the batch."""
+        return self.conv(x)[0]
+
+
 class DualEncoder(nn.Module):
     """Two towers scored against each other — a model whose ``forward()`` takes more than one tensor."""
 

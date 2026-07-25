@@ -13,7 +13,9 @@ from tests.models import (
     PyramidHeads,
     RepeatedBlockStack,
     ResidualBlock,
+    SequenceTagger,
     ShapeMath,
+    SubscriptedLayer,
     TinyCNN,
     UnusedBranch,
 )
@@ -237,6 +239,28 @@ def test_a_leaf_layer_traced_on_its_own_needs_no_example_input():
     """The layer box is drawn from the module itself, so it works without shapes, like every other model."""
     labels = [node.label for node in td.trace(nn.Conv2d(1, 8, 3)).nodes]
     assert labels == ["input", "Conv2d", "output"]
+
+
+def test_a_layer_returning_a_tuple_is_one_box_carrying_its_real_shape():
+    """`out, _ = self.rnn(x)` is a layer, not a layer plus two boxes of Python syntax."""
+    example = torch.randn(1, 5, 4)
+    for backend in ("fx", "export"):
+        graph = td.trace(SequenceTagger(), example, backend=backend)
+        graph.validate()
+        assert [node.label for node in graph.nodes] == ["input", "LSTM", "Linear", "output"]
+        # (4, 1, 6) is the final hidden state, which is a real tensor the layer produces but not the one that leaves.
+        assert next(node for node in graph.nodes if node.label == "LSTM").output_shape == (1, 5, 12)
+
+
+def test_subscripting_a_layers_tensor_output_stays_on_the_diagram():
+    """`self.conv(x)[0]` indexes a tensor; only unpacking a tuple return folds into the layer."""
+    graph = td.trace(SubscriptedLayer(), torch.randn(2, 3, 8, 8))
+    assert [node.op for node in graph.nodes] == ["input", "conv2d", "index", "output"]
+
+
+def test_tuple_unpacking_folds_without_an_example_input():
+    """With no shapes to propagate, a layer selected from at two indices is still a tuple return."""
+    assert [node.label for node in td.trace(SequenceTagger()).nodes] == ["input", "LSTM", "Linear", "output"]
 
 
 def test_export_graphs_still_aggregate():

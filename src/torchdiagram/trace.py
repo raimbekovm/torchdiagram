@@ -10,10 +10,12 @@ falls back to automatically; see docs/design.md.
 
 from __future__ import annotations
 
+import operator
+
 import torch
 import torch.fx
 from torch import nn
-from torch.fx.passes.shape_prop import ShapeProp
+from torch.fx.passes.shape_prop import ShapeProp, TensorMetadata
 
 from .export_trace import trace_export
 from .frontend import (
@@ -123,6 +125,7 @@ def _trace_fx(model: nn.Module, args: tuple[torch.Tensor, ...] | None, *, name: 
     owner: dict[torch.fx.Node, str] = {}
     paths: dict[str, str] = {}
     plumbing = _plumbing(graph_module)
+    unpacking, unpacked_shapes = _tuple_unpacking(graph_module)
     used_ids: set[str] = set()
     results: list[tuple[str | None, torch.fx.Node]] = []
     for fx_node in graph_module.graph.nodes:
@@ -131,11 +134,16 @@ def _trace_fx(model: nn.Module, args: tuple[torch.Tensor, ...] | None, *, name: 
         if fx_node.op == "output":
             results = _results(fx_node)
             continue
+        if fx_node in unpacking:
+            owner[fx_node] = owner[unpacking[fx_node]]  # the layer's box stands in for the unpacking
+            continue
         node = _to_ir(fx_node, graph_module, used_ids)
         if node is None:
             continue
         if fx_node.op == "call_module":
             paths[node.id] = str(fx_node.target)
+            if fx_node in unpacked_shapes:
+                node.output_shape = unpacked_shapes[fx_node]
         owner[fx_node] = node.id
         graph.nodes.append(node)
 
@@ -143,6 +151,61 @@ def _trace_fx(model: nn.Module, args: tuple[torch.Tensor, ...] | None, *, name: 
     graph.edges = build_edges(owner)
     append_outputs(graph, owner, results, _output_shape)
     return graph
+
+
+def _tuple_unpacking(
+    graph_module: torch.fx.GraphModule,
+) -> tuple[dict[torch.fx.Node, torch.fx.Node], dict[torch.fx.Node, tuple[int, ...] | None]]:
+    """Find the nodes that unpack a layer's tuple return, and what shape each such layer really produces.
+
+    ``out, _ = self.lstm(x)`` draws four boxes today: the ``LSTM``, carrying no shape because its fx output is a tuple
+    and shape propagation only records one for a tensor; a ``getitem`` carrying the shape the LSTM should have; and a
+    second ``getitem`` for the discarded hidden state, which nothing consumes and which is a dead stub on the diagram.
+    Two of the four are Python syntax, and the one a reader cares about is the unlabeled one.
+
+    Unpacking is folded into the layer instead: the ``getitem`` nodes stand in for the layer's box, and the layer takes
+    the shape of the element the rest of the graph actually consumes. Subscripting a layer that returns a plain tensor
+    (``self.conv(x)[0]``) is a real operation and is left alone; a tuple return is told apart by shape propagation
+    recording a tuple, or, with no example input to propagate, by the layer being selected from at more than one index,
+    which is what tuple unpacking always generates.
+
+    Args:
+        graph_module: The traced graph module.
+
+    Returns:
+        Each unpacking node mapped to its layer, and each such layer mapped to the shape it should carry.
+    """
+    unpacking: dict[torch.fx.Node, torch.fx.Node] = {}
+    shapes: dict[torch.fx.Node, tuple[int, ...] | None] = {}
+    for fx_node in graph_module.graph.nodes:
+        if not _selects_from_layer(fx_node) or not _returns_tuple(fx_node.args[0]):
+            continue
+        layer = fx_node.args[0]
+        unpacking[fx_node] = layer
+        if layer not in shapes and fx_node.users:  # the first selection anything consumes is the layer's real output
+            shapes[layer] = _output_shape(fx_node)
+    return unpacking, shapes
+
+
+def _selects_from_layer(fx_node: torch.fx.Node) -> bool:
+    """Whether ``fx_node`` selects a fixed position out of a layer's return value."""
+    return (
+        fx_node.op == "call_function"
+        and fx_node.target is operator.getitem
+        and len(fx_node.args) == 2
+        and isinstance(fx_node.args[0], torch.fx.Node)
+        and fx_node.args[0].op == "call_module"
+        and isinstance(fx_node.args[1], int)
+    )
+
+
+def _returns_tuple(layer: torch.fx.Node) -> bool:
+    """Whether a layer returns a tuple the model unpacks, rather than a tensor the model subscripts."""
+    meta = layer.meta.get("tensor_meta")
+    if meta is not None:
+        # TensorMetadata is itself a NamedTuple, so identity is the test, not "is this a tuple".
+        return not isinstance(meta, TensorMetadata)
+    return len({user.args[1] for user in layer.users if _selects_from_layer(user)}) > 1
 
 
 def _results(fx_node: torch.fx.Node) -> list[tuple[str | None, torch.fx.Node]]:

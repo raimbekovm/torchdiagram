@@ -149,6 +149,7 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
     graph = Graph(name=name)
     owner: dict[torch.fx.Node, str] = {}  # every kept fx node, mapped to the IR node that represents it
     by_module: dict[str, Node] = {}
+    members: dict[str, list[torch.fx.Node]] = {}  # submodule path -> the ATen ops it lowered to, in execution order
     used_ids: set[str] = set()
     paths: dict[str, str] = {}  # IR node id mapped to the submodule it came from, for label disambiguation
     plumbing = _plumbing(graph_module)
@@ -188,10 +189,9 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
                     indexing[fx_node] = node
             elif path in by_module:
                 # A single layer can lower to several ATen ops (nn.MultiheadAttention becomes 28 of them); they all
-                # belong to one box, and the group's output is whichever op runs last.
-                merged = by_module[path]
-                owner[fx_node] = merged.id
-                merged.output_shape = _shape(fx_node)
+                # belong to one box, whose shape _group_shape() resolves once the whole group is known.
+                owner[fx_node] = by_module[path].id
+                members[path].append(fx_node)
                 continue
             else:
                 kind = type(module).__name__
@@ -207,14 +207,38 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
                     scope_class=scope_class,
                 )
                 by_module[path] = node
+                members[path] = [fx_node]
                 paths[node.id] = path
         owner[fx_node] = node.id
         graph.nodes.append(node)
+
+    for path, node in by_module.items():
+        node.output_shape = _group_shape(members[path])
 
     qualify_labels(graph.nodes, paths)
     graph.edges = build_edges(owner)
     append_outputs(graph, owner, results, _shape)
     return graph
+
+
+def _group_shape(members: list[torch.fx.Node]) -> tuple[int, ...] | None:
+    """The shape of the value that actually leaves a coalesced layer.
+
+    One layer lowers to many ATen ops, and the last of them is not always the one whose result leaves. An ``nn.LSTM``'s
+    final internal op computes the hidden state, not the output sequence, so annotating the box with the last op's shape
+    prints ``(4, 1, 256)`` on a layer whose next box is a ``Linear(512, 20)`` — a diagram contradicting itself.
+    ``nn.MultiheadAttention`` happens to end on its output projection, which is why taking the last op looked right.
+
+    Args:
+        members: The ATen ops the layer lowered to, in execution order.
+
+    Returns:
+        The shape of the first op whose result is consumed from outside the group, or of the last op when the layer's
+        result leaves nowhere, as in dead code.
+    """
+    inside = set(members)
+    leaving = [node for node in members if any(user not in inside for user in node.users)]
+    return _shape(leaving[0] if leaving else members[-1])
 
 
 def _results(graph_module: torch.fx.GraphModule, fx_node: torch.fx.Node) -> list[tuple[str | None, torch.fx.Node]]:
