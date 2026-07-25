@@ -11,6 +11,7 @@ from tests.models import (
     NonUniformBlockStack,
     RepeatedBlockStack,
     ThreeLevelNet,
+    TiedStack,
     TinyCNN,
     TransformerStack,
     WideningStack,
@@ -220,3 +221,9 @@ def test_aggregate_counts_repeats_of_a_block_that_only_calls_its_children():
     """A block owning no operation of its own is a level like any other, so its repeats are still counted."""
     result = aggregate_blocks(td.trace(DelegatingStack(), torch.randn(1, 8)))
     assert [node.label for node in result.nodes] == ["input", "DelegatingBlock ×3", "output"]
+
+
+def test_aggregate_does_not_badge_a_layer_that_is_shared_rather_than_repeated():
+    """`Linear ×2` claims two sets of weights; a layer listed twice in one Sequential has one."""
+    result = aggregate_blocks(td.trace(TiedStack(), torch.randn(1, 4)))
+    assert not any("×" in node.label for node in result.nodes)

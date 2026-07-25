@@ -410,6 +410,105 @@ class SiameseTower(nn.Module):
         return self.score(self.encode(x) - self.encode(x * 2))
 
 
+class NamedOutput(nn.Module):
+    """Holds a submodule called ``output`` — a name the diagram's own output box wants too."""
+
+    def __init__(self) -> None:
+        """Initialize the stem and the head, the latter named ``output``."""
+        super().__init__()
+        self.stem = nn.Linear(4, 4)
+        self.output = nn.Linear(4, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the stem, then the head."""
+        return self.output(self.stem(x))
+
+
+class NestedReturn(nn.Module):
+    """Returns a tensor and a tuple of two more — the shape a detector returning `(x, (p3, p4))` has."""
+
+    def __init__(self) -> None:
+        """Initialize the stem and the two heads."""
+        super().__init__()
+        self.stem = nn.Linear(4, 4)
+        self.left = nn.Linear(4, 2)
+        self.right = nn.Linear(4, 3)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Return the stem features alongside both head predictions."""
+        h = self.stem(x)
+        return h, (self.left(h), self.right(h))
+
+
+class RepeatedCall(nn.Module):
+    """Applies one layer twice in a row, with nothing in between to separate the two calls."""
+
+    def __init__(self) -> None:
+        """Initialize the single layer."""
+        super().__init__()
+        self.fc = nn.Linear(4, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the layer to its own output."""
+        return self.fc(self.fc(x))
+
+
+class StateOnlyTagger(nn.Module):
+    """Keeps only the recurrent layer's final state, which is a tuple inside a tuple."""
+
+    def __init__(self) -> None:
+        """Initialize the recurrent layer and the classifier."""
+        super().__init__()
+        self.rnn = nn.LSTM(4, 6, batch_first=True)
+        self.fc = nn.Linear(6, 3)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Classify from the final hidden state."""
+        _, (hidden, _) = self.rnn(x)
+        return self.fc(hidden[-1])
+
+
+class OutputOnlyTagger(nn.Module):
+    """Selects the recurrent layer's output at one index only, never touching the state."""
+
+    def __init__(self) -> None:
+        """Initialize the recurrent layer and the classifier."""
+        super().__init__()
+        self.rnn = nn.LSTM(4, 6, batch_first=True)
+        self.fc = nn.Linear(6, 3)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Classify every position of the output sequence."""
+        return self.fc(self.rnn(x)[0])
+
+
+class TiedStack(nn.Module):
+    """Lists one layer object twice in an nn.Sequential — two boxes, one set of weights, no repeat count."""
+
+    def __init__(self) -> None:
+        """Initialize the stack from a single shared layer."""
+        super().__init__()
+        shared = nn.Linear(4, 4)
+        self.body = nn.Sequential(shared, shared)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the stack."""
+        return self.body(x)
+
+
+class NumberedReuse(nn.Module):
+    """Applies a container at a numeric submodule path twice, which the two tracers used to number differently."""
+
+    def __init__(self) -> None:
+        """Initialize the reused block."""
+        super().__init__()
+        self.body = nn.Sequential(nn.Linear(4, 4), nn.ReLU())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the block to its own output."""
+        return self.body(self.body(x))
+
+
 class DualEncoder(nn.Module):
     """Two towers scored against each other — a model whose ``forward()`` takes more than one tensor."""
 

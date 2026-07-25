@@ -44,8 +44,11 @@ from .graph import Graph, Node
 # them and trace_export() says the one thing that matters in a single warning.
 _LOG_PREFIX = "torch"
 
-_Entries = list[tuple[str, object]]
-"""A node's ``nn_module_stack`` as ``(submodule path, class)`` pairs, outermost first."""
+_Entries = list[tuple[str, str, object]]
+"""A node's ``nn_module_stack`` as ``(call key, submodule path, class)`` triples, outermost first.
+
+The path names the module; the key names *this call of it*. Export appends ``@1``, ``@2`` and so on to the key when a
+module is applied more than once, which is the only thing separating two calls of one layer in an ATen graph."""
 
 
 def trace_export(model: nn.Module, example_input: ExampleInput, *, name: str | None = None) -> Graph:
@@ -151,7 +154,7 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
     """
     graph = Graph(name=name)
     owner: dict[torch.fx.Node, str] = {}  # every kept fx node, mapped to the IR node that represents it
-    by_module: dict[str, Node] = {}  # submodule path -> the box its current, still-open run of ops draws as
+    by_call: dict[str, Node] = {}  # nn_module_stack call key -> the box that call of the layer draws as
     members: dict[str, list[torch.fx.Node]] = {}  # box id -> the ATen ops it covers, in execution order
     boxes: dict[str, Node] = {}  # box id -> the box, so a run's shape can be resolved after the walk
     used_ids: set[str] = set()
@@ -160,10 +163,9 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
     pending = _direct_parameters(model, graph_module, plumbing)  # parameter boxes, held back until first consumed
     indexing: dict[torch.fx.Node, Node] = {}  # indexing ops, mapped to the box the whole subscript draws as
     results: list[tuple[str | None, torch.fx.Node]] = []
-    open_path: str | None = None  # the layer whose run of ATen ops is still being collected
 
     for fx_node in graph_module.graph.nodes:
-        record_scopes(_stack(fx_node), graph.scopes)
+        record_scopes([(path, cls) for _, path, cls in _stack(fx_node)], graph.scopes)
         if fx_node.op == "output":
             results = _results(graph_module, fx_node)
             continue
@@ -172,7 +174,7 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
         elif fx_node.op != "call_function" or fx_node in plumbing:
             continue  # a layer's own weights, the synthetic _guards_fn module, and symbolic guard assertions
         else:
-            path, module, ancestors = _leaf_module(model, _stack(fx_node))
+            call, path, module, ancestors = _leaf_module(model, _stack(fx_node))
             if module is None:
                 label = _label(fx_node.target)
                 continued = _continues_subscript(fx_node, label, indexing)
@@ -194,12 +196,12 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
                 )
                 if label == "index":
                     indexing[fx_node] = node
-            elif path == open_path:
+            elif call in by_call:
                 # A single layer can lower to several ATen ops (nn.MultiheadAttention becomes 28 of them); they all
-                # belong to one box, whose shape _group_shape() resolves once the whole run is known. Only an unbroken
-                # run merges: a layer applied twice is two boxes, as it is under fx, not one box fed twice.
-                owner[fx_node] = by_module[path].id
-                members[by_module[path].id].append(fx_node)
+                # belong to one box, whose shape _group_shape() resolves once the whole run is known. Grouping by the
+                # call key rather than the module path keeps a layer applied twice as two boxes, as it is under fx.
+                owner[fx_node] = by_call[call].id
+                members[by_call[call].id].append(fx_node)
                 continue
             else:
                 kind = type(module).__name__
@@ -214,11 +216,10 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
                     scope=scope,
                     scope_class=scope_class,
                 )
-                by_module[path] = node
+                by_call[call] = node
                 members[node.id] = [fx_node]
                 boxes[node.id] = node
                 paths[node.id] = path
-            open_path = path if module is not None else None
         for upstream in fx_node.all_input_nodes:  # a parameter box appears just before the op that first reads it
             parameter = pending.pop(upstream, None)
             if parameter is not None:
@@ -232,7 +233,7 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
 
     qualify_labels(graph.nodes, paths)
     graph.edges = build_edges(owner)
-    append_outputs(graph, owner, results, _shape)
+    append_outputs(graph, owner, results, _shape, used_ids)
     return graph
 
 
@@ -259,7 +260,7 @@ def _direct_parameters(
         if fx_node.op != "get_attr":
             continue
         readers = [user for user in fx_node.users if user.op == "call_function" and user not in plumbing]
-        if any(_leaf_module(model, _stack(user))[1] is None for user in readers):
+        if any(_leaf_module(model, _stack(user))[2] is None for user in readers):
             direct[fx_node] = parameter_node(model, str(fx_node.target), _shape(fx_node))
     return direct
 
@@ -358,7 +359,7 @@ def _continues_subscript(fx_node: torch.fx.Node, label: str, indexing: dict[torc
     return indexing[source] if line is not None and line == source.meta.get("stack_trace") else None
 
 
-def _leaf_module(model: nn.Module, entries: _Entries) -> tuple[str, nn.Module | None, _Entries]:
+def _leaf_module(model: nn.Module, entries: _Entries) -> tuple[str, str, nn.Module | None, _Entries]:
     """Resolve the leaf ``nn.Module`` a node was lowered from, if it was lowered from one.
 
     The stack is walked **outermost-first**, which is the direction fx applies the same predicate while tracing: the
@@ -375,17 +376,18 @@ def _leaf_module(model: nn.Module, entries: _Entries) -> tuple[str, nn.Module | 
         entries: The node's ``nn_module_stack`` entries, outermost first.
 
     Returns:
-        A ``(path, module, ancestors)`` triple; ``module`` is ``None`` when the node came from functional code rather:
-            than a leaf layer, and ``ancestors`` is the entries above the resolved one, for scope resolution.
+        A ``(call key, path, module, ancestors)`` tuple; ``module`` is ``None`` when the node came from functional code
+        rather than a leaf layer, and ``ancestors`` is the entries above the resolved one, for scope resolution.
     """
-    for index, (path, _) in enumerate(entries):
+    for index, (key, path, _) in enumerate(entries):
         try:
             module = model.get_submodule(path)
         except AttributeError:  # a path export synthesized that the original model doesn't have
             continue
         if LEAF_PROBE.is_leaf_module(module, path):
-            return path, module, entries[:index]
-    return (entries[-1][0] if entries else ""), None, entries
+            return key, path, module, entries[:index]
+    last = entries[-1] if entries else ("", "", None)
+    return last[0], last[1], None, entries
 
 
 def _scope(entries: _Entries) -> tuple[str | None, str | None]:
@@ -400,14 +402,14 @@ def _scope(entries: _Entries) -> tuple[str | None, str | None]:
     """
     if not entries:
         return None, None
-    path, cls = entries[-1]
+    _, path, cls = entries[-1]
     return path, class_name(cls)
 
 
 def _stack(fx_node: torch.fx.Node) -> _Entries:
-    """Read ``nn_module_stack`` as ``(path, class)`` entries, dropping the root module fx never records."""
+    """Read ``nn_module_stack`` as ``(call key, path, class)`` entries, dropping the root module fx never records."""
     stack = fx_node.meta.get("nn_module_stack")
-    return [entry for entry in stack.values() if entry[0]] if stack else []
+    return [(key, path, cls) for key, (path, cls) in stack.items() if path] if stack else []
 
 
 def _label(target: object) -> str:

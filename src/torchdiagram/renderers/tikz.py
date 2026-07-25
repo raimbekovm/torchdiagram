@@ -35,7 +35,9 @@ _ESCAPES = {
     **{char: f"\\{char}" for char in "{}_#&$%"},
 }
 
-_COLUMN_MM = 42  # horizontal step between grid columns, wider than the 32mm minimum node width
+_NODE_MM = 32  # the minimum node width set in the preamble
+_CHAR_MM = 1.5  # rough width of one character at \small, for sizing the column step to the longest label
+_COLUMN_GAP_MM = 10
 _ROW_MM = 15  # vertical step between grid rows
 
 
@@ -53,10 +55,14 @@ def to_tikz(graph: Graph, *, theme: Theme = DEFAULT) -> str:
     grid = place(graph)
     names = _names(graph)
     lines = _preamble(theme)
+    # A node grows past the preamble's minimum width to fit its label, so the column step has to follow the longest
+    # one or two boxes on the same row would touch.
+    longest = max((_visible_width(node) for node in graph.nodes), default=0)
+    column_mm = max(_NODE_MM, longest * _CHAR_MM) + _COLUMN_GAP_MM
 
     for node in graph.nodes:
         style = "io" if node.is_io else "block"
-        x = grid.columns[node.id] * _COLUMN_MM
+        x = grid.columns[node.id] * column_mm
         y = -grid.rows[node.id] * _ROW_MM
         lines.append(rf"\node[{style}] ({names[node.id]}) at ({x}mm,{y}mm) {{{_node_text(node)}}};")
 
@@ -71,6 +77,12 @@ def to_tikz(graph: Graph, *, theme: Theme = DEFAULT) -> str:
 
     lines += [r"\end{tikzpicture}", r"\end{document}", ""]
     return "\n".join(lines)
+
+
+def _visible_width(node: Node) -> int:
+    """Characters the reader actually sees in a node's box, ignoring the LaTeX markup around them."""
+    shape = len("x".join(str(dim) for dim in node.output_shape)) if node.output_shape is not None else 0
+    return max(len(node.label), shape)
 
 
 def _names(graph: Graph) -> dict[str, str]:

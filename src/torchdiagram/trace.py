@@ -156,7 +156,7 @@ def _trace_fx(model: nn.Module, args: tuple[torch.Tensor, ...] | None, *, name: 
 
     qualify_labels(graph.nodes, paths)
     graph.edges = build_edges(owner)
-    append_outputs(graph, owner, results, _output_shape)
+    append_outputs(graph, owner, results, _output_shape, used_ids)
     return graph
 
 
@@ -242,34 +242,59 @@ def _tuple_unpacking(
     unpacking: dict[torch.fx.Node, torch.fx.Node] = {}
     shapes: dict[torch.fx.Node, tuple[int, ...] | None] = {}
     for fx_node in graph_module.graph.nodes:
-        if not _selects_from_layer(fx_node) or not _returns_tuple(fx_node.args[0]):
+        if not _selects(fx_node):
             continue
-        layer = fx_node.args[0]
+        source = fx_node.args[0]
+        if not _returns_tuple(source):
+            continue  # the source is a tensor, so this is a subscript of it — a real operation, not unpacking
+        # `_, (h, c) = self.rnn(x)` selects the state tuple out of the layer and then selects again out of that, so a
+        # selection whose source is itself unpacking belongs to the same layer.
+        if source in unpacking:
+            layer = unpacking[source]
+        elif source.op == "call_module":
+            layer = source
+        else:
+            continue
         unpacking[fx_node] = layer
-        if layer not in shapes and fx_node.users:  # the first selection anything consumes is the layer's real output
+        # The layer's real output is the first selected element anything downstream consumes, and only a tensor has a
+        # shape to take — a selection that lands on another tuple is a step on the way, not the answer.
+        if fx_node.users and _output_shape(fx_node) is not None and shapes.get(layer) is None:
             shapes[layer] = _output_shape(fx_node)
     return unpacking, shapes
 
 
-def _selects_from_layer(fx_node: torch.fx.Node) -> bool:
-    """Whether ``fx_node`` selects a fixed position out of a layer's return value."""
+def _selects(fx_node: torch.fx.Node) -> bool:
+    """Whether ``fx_node`` selects a fixed position out of another node's return value."""
     return (
         fx_node.op == "call_function"
         and fx_node.target is operator.getitem
         and len(fx_node.args) == 2
         and isinstance(fx_node.args[0], torch.fx.Node)
-        and fx_node.args[0].op == "call_module"
         and isinstance(fx_node.args[1], int)
     )
 
 
-def _returns_tuple(layer: torch.fx.Node) -> bool:
-    """Whether a layer returns a tuple the model unpacks, rather than a tensor the model subscripts."""
-    meta = layer.meta.get("tensor_meta")
+def _returns_tuple(fx_node: torch.fx.Node) -> bool:
+    """Whether a node produces a tuple the model unpacks, rather than a tensor the model subscripts.
+
+    Asked of a layer, this separates ``out, _ = self.rnn(x)`` from ``self.conv(x)[0]``. Asked of an unpacking node, it
+    separates a further step of the same unpacking — the state tuple in ``_, (h, c) = self.rnn(x)`` — from a subscript
+    of the tensor it landed on, ``hidden[-1]``, which is a real operation and keeps its box.
+    """
+    meta = fx_node.meta.get("tensor_meta")
     if meta is not None:
         # TensorMetadata is itself a NamedTuple, so identity is the test, not "is this a tuple".
         return not isinstance(meta, TensorMetadata)
-    return len({user.args[1] for user in layer.users if _selects_from_layer(user)}) > 1
+    # No example input, so nothing propagated a shape to read. `self.rnn(x)[0]` and `self.conv(x)[0]` look identical
+    # from the graph alone, and answering "it is a tuple" only when two indices are selected would make the same model
+    # draw a different box count with and without shapes. Where torch defines the return, the class settles it; the
+    # two-index rule catches a custom module unpacked the ordinary way.
+    module = fx_node.graph.owning_module
+    if fx_node.op == "call_module" and module is not None:
+        resolved = module.get_submodule(str(fx_node.target))
+        if isinstance(resolved, (nn.RNNBase, nn.MultiheadAttention)):
+            return True
+    return len({user.args[1] for user in fx_node.users if _selects(user)}) > 1
 
 
 def _results(fx_node: torch.fx.Node) -> list[tuple[str | None, torch.fx.Node]]:
@@ -289,13 +314,28 @@ def _results(fx_node: torch.fx.Node) -> list[tuple[str | None, torch.fx.Node]]:
     if isinstance(result, torch.fx.Node):
         return [(None, result)]
     if isinstance(result, dict):
-        structure, names, values = "dict", list(result), list(result.values())
+        structure, names = "dict", list(result)
     elif isinstance(result, (tuple, list)):
-        structure, names, values = "tuple", None, list(result)
+        structure, names = "tuple", None
     else:
         return []
+    values = _flatten(result)
     keys = result_keys(len(values), structure, names)
     return [(key, value) for key, value in zip(keys, values, strict=True) if isinstance(value, torch.fx.Node)]
+
+
+def _flatten(result: object) -> list[object]:
+    """Every leaf of a returned structure, in return order.
+
+    A model returning ``(x, (p3, p4, p5))`` returns four tensors, and export flattens the structure away before the
+    graph's ``output`` node ever sees it. Taking fx's nested argument at face value instead would drop the whole inner
+    tuple, leaving its producers with no outgoing edge and dangling off the diagram.
+    """
+    if isinstance(result, dict):
+        return [leaf for value in result.values() for leaf in _flatten(value)]
+    if isinstance(result, (tuple, list)):
+        return [leaf for value in result for leaf in _flatten(value)]
+    return [result]
 
 
 def _plumbing(graph_module: torch.fx.GraphModule) -> set[torch.fx.Node]:
@@ -358,6 +398,9 @@ def _to_ir(fx_node: torch.fx.Node, graph_module: torch.fx.GraphModule, used_ids:
         label = type(module).__name__
         op = label.lower()
         extra = module.extra_repr()
+        # Numbered off the submodule path, not off fx's own node name: fx strips a trailing `_<digits>` before
+        # renumbering, so a second call of `body.0` becomes `body_2` there and `body_0_1` here.
+        node_id = unique_id(str(fx_node.target).replace(".", "_"), used_ids)
     elif fx_node.op == "call_function":
         op = label = normalize_label(getattr(fx_node.target, "__name__", str(fx_node.target)))
         node_id = unique_id(op, used_ids)

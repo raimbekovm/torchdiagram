@@ -10,12 +10,18 @@ from tests.models import (
     CroppedHead,
     DualEncoder,
     GatedNet,
+    NamedOutput,
+    NestedReturn,
+    NumberedReuse,
+    OutputOnlyTagger,
     PyramidHeads,
     RepeatedBlockStack,
+    RepeatedCall,
     ResidualBlock,
     SequenceTagger,
     ShapeMath,
     SiameseTower,
+    StateOnlyTagger,
     SubscriptedLayer,
     TinyCNN,
     TokenPrefix,
@@ -309,6 +315,56 @@ def test_a_mismatched_example_input_does_not_print_a_stack(capsys):
     with pytest.raises(ValueError):
         td.trace(TinyCNN(), torch.randn(1, 3, 28, 28))
     assert "Traceback" not in capsys.readouterr().err
+
+
+def test_an_output_box_does_not_collide_with_a_submodule_called_output():
+    """The output box is named after the return it carries, and a model may hold a submodule of that name."""
+    for backend in ("fx", "export"):
+        graph = td.trace(NamedOutput(), torch.randn(1, 4), backend=backend)
+        graph.validate()  # would raise "duplicate node ids: ['output']"
+        assert [node.label for node in graph.nodes if node.op == "output"] == ["output"]
+
+
+def test_a_nested_return_structure_is_flattened():
+    """`return h, (a, b)` returns three tensors; taking the nested tuple at face value drops two of them."""
+    for backend in ("fx", "export"):
+        graph = td.trace(NestedReturn(), torch.randn(1, 4), backend=backend)
+        graph.validate()
+        outputs = [node for node in graph.nodes if node.op == "output"]
+        assert [node.label for node in outputs] == ["output[0]", "output[1]", "output[2]"]
+        # Every head has somewhere to go; a dropped return leaves its producer dangling.
+        assert all(any(edge.source == node.id for edge in graph.edges) for node in graph.nodes if not node.is_io)
+
+
+def test_a_layer_applied_twice_in_a_row_is_two_boxes_in_both_frontends():
+    """Nothing separates the two calls, so the run of ATen ops is unbroken; the call key is what tells them apart."""
+    for backend in ("fx", "export"):
+        labels = [node.label for node in td.trace(RepeatedCall(), torch.randn(1, 4), backend=backend).nodes]
+        assert labels == ["input", "Linear (fc, call 1)", "Linear (fc, call 2)", "output"]
+
+
+def test_nested_tuple_unpacking_folds_into_the_layer():
+    """`_, (h, c) = self.rnn(x)` selects out of the state tuple, one level below what the first fold handled."""
+    for backend in ("fx", "export"):
+        graph = td.trace(StateOnlyTagger(), torch.randn(1, 5, 4), backend=backend)
+        graph.validate()
+        # Both selections out of the layer are folded away; the one left is `hidden[-1]`, a subscript of a tensor.
+        assert [node.label for node in graph.nodes] == ["input", "LSTM", "index", "Linear", "output"]
+
+
+def test_tuple_unpacking_folds_the_same_way_with_and_without_shapes():
+    """--input-shape is documented as adding annotations; it must not also change how many boxes there are."""
+    with_shapes = [node.label for node in td.trace(OutputOnlyTagger(), torch.randn(1, 5, 4)).nodes]
+    without = [node.label for node in td.trace(OutputOnlyTagger()).nodes]
+    assert with_shapes == without == ["input", "LSTM", "Linear", "output"]
+
+
+def test_a_reused_container_at_a_numeric_path_gets_the_same_ids_from_both_frontends():
+    """Fx renumbers off its own node names and strips a trailing `_<digits>`; ids have to come from the path."""
+    example = torch.randn(1, 4)
+    by_fx = [node.id for node in td.trace(NumberedReuse(), example, backend="fx").nodes]
+    by_export = [node.id for node in td.trace(NumberedReuse(), example, backend="export").nodes]
+    assert by_fx == by_export
 
 
 def test_export_graphs_still_aggregate():

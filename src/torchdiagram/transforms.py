@@ -50,8 +50,9 @@ def aggregate_blocks(graph: Graph, *, min_repeats: int = 2) -> Graph:
             each eligible group still collapses, just individually.
 
     Returns:
-        A new, validated graph with eligible scopes collapsed; everything else is copied through unchanged,
-        in its original order.
+        A new, validated graph with eligible scopes collapsed. ``graph`` itself is untouched, but nodes that were not
+        collapsed are carried over by reference rather than copied, so mutating one of them afterwards mutates it in
+        both graphs.
     """
     nodes, edges = list(graph.nodes), list(graph.edges)
     structure: dict[str, str] = {}  # synthetic node id -> digest of everything that node collapsed
@@ -125,8 +126,17 @@ def _edge_index(edges: list[Edge]) -> tuple[dict[str, list[Edge]], dict[str, lis
 
 
 def _repeatable(node: Node) -> bool:
-    """Whether ``node`` is a layer inside a container, which is the only thing a repeat count can be claimed about."""
-    return node.scope is not None and node.scope_class is not None and node.op != "block"
+    """Whether ``node`` is a layer inside a container, which is the only thing a repeat count can be claimed about.
+
+    A node marked ``shared_with`` is one layer drawn once per call, so badging a run of them ``×2`` would put back
+    exactly the claim — two sets of weights where the model has one — that the marker exists to remove.
+    """
+    return (
+        node.scope is not None
+        and node.scope_class is not None
+        and node.op != "block"
+        and "shared_with" not in node.params
+    )
 
 
 def _interchangeable(first: Node, second: Node, structure: dict[str, str]) -> bool:

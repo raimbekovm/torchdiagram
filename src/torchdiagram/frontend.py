@@ -107,6 +107,7 @@ def append_outputs(
     owner: dict[torch.fx.Node, str],
     results: Sequence[tuple[str | None, torch.fx.Node]],
     shape: Callable[[torch.fx.Node], tuple[int, ...] | None],
+    used_ids: set[str],
 ) -> None:
     """Add one ``output`` node per returned tensor, each edged from whatever produced it.
 
@@ -121,9 +122,12 @@ def append_outputs(
         results: The returned tensors as ``(key, producing fx node)`` pairs, in return order; ``key`` is ``None`` for a
             model that returns a single tensor.
         shape: Reads a node's output shape, which the two frontends record differently.
+        used_ids: Ids already handed out. An output box is named after the return it carries, and a model is free to
+            hold a submodule called ``output``, so the two have to be kept apart.
     """
     for key, producer in results:
         node_id, label = _output_identity(key)
+        node_id = unique_id(node_id, used_ids)
         graph.nodes.append(Node(id=node_id, op="output", label=label, output_shape=shape(producer)))
         for source_id in [owner[producer]] if producer in owner else _sources(producer, owner):
             graph.edges.append(Edge(source=source_id, target=node_id))
@@ -239,8 +243,10 @@ def leaf_root_graph(model: torch.nn.Module, args: tuple[torch.Tensor, ...] | Non
 
     results = _leaf_root_results(model, args)
     layer.output_shape = results[0][1] if len(results) == 1 else None
+    used_ids = {node.id for node in graph.nodes} | {layer.id}
     for key, shape in results:
         node_id, label = _output_identity(key)
+        node_id = unique_id(node_id, used_ids)
         graph.nodes.append(Node(id=node_id, op="output", label=label, output_shape=shape))
         graph.edges.append(Edge(source=layer.id, target=node_id))
     return graph
