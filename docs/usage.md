@@ -61,6 +61,25 @@ graph = td.trace(model, example_input, backend="fx")  # never fall back
 graph = td.trace(model, example_input, backend="export")  # skip fx entirely
 ```
 
+### Several inputs, several outputs
+
+A model whose `forward()` takes more than one tensor takes a tuple of example inputs, one per argument:
+
+```python
+graph = td.trace(model, (user_batch, item_batch))
+graph = td.trace(model, x)  # the one-argument shorthand, unchanged
+```
+
+On the other end, each returned tensor gets its own output box carrying its own shape, labeled with the tuple
+index or dict key it was returned under — `output[0]`, `output[1]`, `output[logits]`. A model returning a
+single tensor keeps the plain `output` box.
+
+```python
+graph = td.trace(detector, torch.randn(1, 3, 256, 256))
+[node.label for node in graph.nodes if node.op == "output"]
+# ['output[0]', 'output[1]', 'output[2]']
+```
+
 ### Other tracing limitations
 
 - **Non-tensor containers with dynamic contents** and some dynamic Python features inside `forward()` may not be traceable by either frontend.

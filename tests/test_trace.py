@@ -4,7 +4,16 @@ import pytest
 import torch
 
 import torchdiagram as td
-from tests.models import GatedNet, RepeatedBlockStack, ResidualBlock, ShapeMath, TinyCNN, UnusedBranch
+from tests.models import (
+    DualEncoder,
+    GatedNet,
+    PyramidHeads,
+    RepeatedBlockStack,
+    ResidualBlock,
+    ShapeMath,
+    TinyCNN,
+    UnusedBranch,
+)
 
 
 def test_trace_produces_valid_graph_with_io_nodes():
@@ -137,6 +146,32 @@ def test_unknown_backend_is_rejected():
         td.trace(TinyCNN(), torch.randn(1, 1, 28, 28), backend="onnx")
 
 
+def test_several_example_inputs_reach_a_multi_input_model():
+    """A model taking two tensors takes a tuple of them, and every node still gets a shape."""
+    graph = td.trace(DualEncoder(), (torch.randn(1, 4), torch.randn(1, 8)))
+    graph.validate()
+    inputs = [node for node in graph.nodes if node.op == "input"]
+    assert [node.output_shape for node in inputs] == [(1, 4), (1, 8)]
+    assert all(node.output_shape is not None for node in graph.nodes)
+
+
+def test_each_returned_tensor_gets_its_own_output_node():
+    """A model returning several tensors draws one output box per tensor, each with its own shape."""
+    graph = td.trace(PyramidHeads(), torch.randn(1, 3, 8, 8))
+    graph.validate()
+    outputs = [node for node in graph.nodes if node.op == "output"]
+    assert [node.label for node in outputs] == ["output[0]", "output[1]"]
+    assert [node.output_shape for node in outputs] == [(1, 2, 8, 8), (1, 2, 4, 4)]
+    # Three arrows into one box would say the levels merge; each prediction leaves on its own.
+    assert all(len([edge for edge in graph.edges if edge.target == node.id]) == 1 for node in outputs)
+
+
+def test_single_return_keeps_one_plain_output_node():
+    """A model returning one tensor is unchanged: one box labeled 'output', not 'output[0]'."""
+    outputs = [node for node in td.trace(TinyCNN()).nodes if node.op == "output"]
+    assert [node.label for node in outputs] == ["output"]
+
+
 @pytest.mark.parametrize(
     ("model", "example"),
     [
@@ -144,6 +179,8 @@ def test_unknown_backend_is_rejected():
         (ResidualBlock(), torch.randn(1, 4, 8, 8)),
         (RepeatedBlockStack(2), torch.randn(1, 3, 8, 8)),
         (UnusedBranch(), torch.randn(1, 4)),
+        (DualEncoder(), (torch.randn(1, 4), torch.randn(1, 8))),
+        (PyramidHeads(), torch.randn(1, 3, 8, 8)),
     ],
 )
 def test_both_frontends_emit_the_same_ir(model, example):

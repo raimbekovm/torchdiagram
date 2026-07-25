@@ -31,6 +31,15 @@ def test_cli_omits_aggregation_by_default(tmp_path):
     assert "×4" not in content
 
 
+def test_cli_input_shape_repeats_for_a_multi_input_model(tmp_path):
+    """'--input-shape' given once per forward() argument shape-annotates a model taking two tensors."""
+    output = tmp_path / "dual.svg"
+    main(["tests.models:DualEncoder", "-o", str(output), "--input-shape", "1,4", "--input-shape", "1,8"])
+    content = output.read_text()
+    assert "1×4" in content
+    assert "1×8" in content
+
+
 def test_cli_rejects_bad_import_path():
     """A non-importable model spec exits with a clear error."""
     with pytest.raises(SystemExit, match="cannot import"):

@@ -8,9 +8,30 @@ frontends are contracted to emit the same IR for the same model.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
+
+import torch
 import torch.fx
 
-from .graph import Edge, Node, scope_leaf
+from .graph import Edge, Graph, Node, scope_leaf
+
+ExampleInput = torch.Tensor | tuple[torch.Tensor, ...]
+"""One example tensor, or one per positional argument of ``forward()``."""
+
+
+def as_args(example_input: ExampleInput) -> tuple[torch.Tensor, ...]:
+    """Normalize an example input into the argument tuple every call site downstream already wants.
+
+    ``ShapeProp.propagate``, ``torch.export.export``, and ``draft_export`` all take one argument per parameter of
+    ``forward()``; a bare tensor is the one-argument shorthand, so a two-tower or encoder-decoder model passes a tuple.
+
+    Args:
+        example_input: A single tensor, or a tuple with one per ``forward()`` argument.
+
+    Returns:
+        The arguments as a tuple.
+    """
+    return example_input if isinstance(example_input, tuple) else (example_input,)
 
 
 def build_edges(owner: dict[torch.fx.Node, str]) -> list[Edge]:
@@ -55,6 +76,56 @@ def _sources(fx_node: torch.fx.Node, owner: dict[torch.fx.Node, str]) -> list[st
         else:
             found.append(node_id)
     return found
+
+
+def append_outputs(
+    graph: Graph,
+    owner: dict[torch.fx.Node, str],
+    results: Sequence[tuple[str | None, torch.fx.Node]],
+    shape: Callable[[torch.fx.Node], tuple[int, ...] | None],
+) -> None:
+    """Add one ``output`` node per returned tensor, each edged from whatever produced it.
+
+    A model returning ``(p3, p4, p5)`` returns three separate tensors that the caller unpacks; drawing them as three
+    arrows into one box says they merge, which is the one reading that is definitely wrong. Each gets its own box,
+    carrying its own shape and the tuple index or dict key it was returned under, so the diagram distinguishes "returns
+    three tensors" from "returns one". A lone return keeps the plain ``output`` box it always had.
+
+    Args:
+        graph: Graph to append to. Modified in place.
+        owner: Every kept fx node, mapped to the id of the IR node representing it.
+        results: The returned tensors as ``(key, producing fx node)`` pairs, in return order; ``key`` is ``None`` for a
+            model that returns a single tensor.
+        shape: Reads a node's output shape, which the two frontends record differently.
+    """
+    for key, producer in results:
+        node_id, label = _output_identity(key)
+        graph.nodes.append(Node(id=node_id, op="output", label=label, output_shape=shape(producer)))
+        for source_id in [owner[producer]] if producer in owner else _sources(producer, owner):
+            graph.edges.append(Edge(source=source_id, target=node_id))
+
+
+def _output_identity(key: str | None) -> tuple[str, str]:
+    """Id and label for one returned tensor, keyed by its tuple index or dict key."""
+    return ("output", "output") if key is None else (f"output_{key}", f"output[{key}]")
+
+
+def result_keys(count: int, structure: str | None, names: Sequence[str] | None) -> list[str | None]:
+    """Name each returned tensor by its dict key or tuple index, or leave a single return unnamed.
+
+    Args:
+        count: How many tensors the model returns.
+        structure: ``"dict"``, ``"tuple"``, or ``None`` when the model returns one bare tensor.
+        names: Dict keys in return order, when ``structure`` is ``"dict"``.
+
+    Returns:
+        One key per returned tensor, or ``[None]`` for a single unwrapped return.
+    """
+    if structure is None and count == 1:
+        return [None]
+    if structure == "dict" and names is not None and len(names) == count:
+        return [str(name) for name in names]
+    return [str(index) for index in range(count)]
 
 
 def qualify_labels(nodes: list[Node], paths: dict[str, str]) -> None:

@@ -15,12 +15,12 @@ td.render(graph, "model.svg")
 
 Trace a PyTorch module into a renderable graph.
 
-| Parameter       | Type                   | Description                                                                                                                                  |
-| --------------- | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`         | `nn.Module`            | Module to trace. `forward()` may be arbitrary fx-traceable code, or need the `torch.export` frontend.                                        |
-| `example_input` | `torch.Tensor \| None` | When given, a forward pass is shape-propagated and every node carries its output shape. Required by the `torch.export` frontend.             |
-| `name`          | `str \| None`          | Diagram title. Defaults to the model's class name.                                                                                           |
-| `backend`       | `str`                  | Tracing frontend: `"auto"` (default) uses `torch.fx` and falls back to `torch.export`, `"fx"` and `"export"` pin one. Both emit the same IR. |
+| Parameter       | Type                                               | Description                                                                                                                                                                                                           |
+| --------------- | -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`         | `nn.Module`                                        | Module to trace. `forward()` may be arbitrary fx-traceable code, or need the `torch.export` frontend.                                                                                                                 |
+| `example_input` | `torch.Tensor \| tuple[torch.Tensor, ...] \| None` | When given, a forward pass is shape-propagated and every node carries its output shape. Required by the `torch.export` frontend. A model whose `forward()` takes several tensors takes a tuple with one per argument. |
+| `name`          | `str \| None`                                      | Diagram title. Defaults to the model's class name.                                                                                                                                                                    |
+| `backend`       | `str`                                              | Tracing frontend: `"auto"` (default) uses `torch.fx` and falls back to `torch.export`, `"fx"` and `"export"` pin one. Both emit the same IR.                                                                          |
 
 Raises `torch.fx.proxy.TraceError` when no frontend can trace the model, and `ValueError` for an unknown `backend` or for `backend="export"` without an `example_input`.
 
