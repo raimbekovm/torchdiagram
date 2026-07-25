@@ -294,6 +294,23 @@ def test_a_layer_applied_twice_is_marked_as_one_set_of_weights():
         assert shared[0].params["shared_with"] == [shared[1].id]
 
 
+def test_a_mismatched_example_input_is_reported_in_the_users_terms():
+    """The model traced fine; the tensor was wrong. The error says which layer rejected it and what it expected."""
+    with pytest.raises(ValueError) as failure:
+        td.trace(TinyCNN(), torch.randn(1, 3, 28, 28))
+    message = str(failure.value)
+    assert "example input (1, 3, 28, 28) does not run through this model" in message
+    assert "layer 'conv' (Conv2d)" in message
+    assert "1 channels, but got 3 channels" in message
+
+
+def test_a_mismatched_example_input_does_not_print_a_stack(capsys):
+    """Shape propagation prints the stack itself from inside torch; the error line is the whole output."""
+    with pytest.raises(ValueError):
+        td.trace(TinyCNN(), torch.randn(1, 3, 28, 28))
+    assert "Traceback" not in capsys.readouterr().err
+
+
 def test_export_graphs_still_aggregate():
     """Scope survives the export frontend, so block aggregation works on its graphs unchanged."""
     graph = td.trace(RepeatedBlockStack(4), torch.randn(1, 3, 8, 8), backend="export")

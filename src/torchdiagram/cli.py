@@ -85,9 +85,11 @@ def main(argv: list[str] | None = None) -> None:
         try:
             graph = trace(model, example, backend=args.backend)
         except torch.fx.proxy.TraceError as exc:
-            raise SystemExit(f"error: cannot trace {args.model!r}: {exc}") from exc
+            # `from None`: the message carries what the user needs, and a chained traceback through torch internals is
+            # the thing these errors exist to replace.
+            raise SystemExit(f"error: cannot trace {args.model!r}: {exc}") from None
         except ValueError as exc:
-            raise SystemExit(f"error: {exc}") from exc
+            raise SystemExit(f"error: {exc}") from None
     for warning in caught:
         if issubclass(warning.category, UserWarning):
             print(f"note: {warning.message}", file=sys.stderr)

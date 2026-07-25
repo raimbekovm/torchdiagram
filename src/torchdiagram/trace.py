@@ -10,7 +10,9 @@ falls back to automatically; see docs/design.md.
 
 from __future__ import annotations
 
+import io
 import operator
+from contextlib import redirect_stderr
 
 import torch
 import torch.fx
@@ -119,10 +121,11 @@ def _trace_fx(model: nn.Module, args: tuple[torch.Tensor, ...] | None, *, name: 
     Raises:
         torch.fx.proxy.TraceError: If ``model`` is not symbolically traceable, e.g. due to data-dependent control flow
             in ``forward()``.
+        ValueError: If ``args`` cannot be run through the model, e.g. an example input with the wrong channel count.
     """
     graph_module = torch.fx.symbolic_trace(model)
     if args is not None:
-        ShapeProp(graph_module).propagate(*args)
+        _propagate_shapes(graph_module, args)
 
     graph = Graph(name=name or type(model).__name__)
     owner: dict[torch.fx.Node, str] = {}
@@ -155,6 +158,63 @@ def _trace_fx(model: nn.Module, args: tuple[torch.Tensor, ...] | None, *, name: 
     graph.edges = build_edges(owner)
     append_outputs(graph, owner, results, _output_shape)
     return graph
+
+
+class _ShapeProp(ShapeProp):
+    """Shape propagation that remembers the node it is on, so a failure can name what rejected the input."""
+
+    current: torch.fx.Node | None = None
+
+    def run_node(self, n: torch.fx.Node) -> object:
+        """Record ``n`` as the node in flight, then run it."""
+        self.current = n
+        return super().run_node(n)
+
+
+def _propagate_shapes(graph_module: torch.fx.GraphModule, args: tuple[torch.Tensor, ...]) -> None:
+    """Annotate every node with its output shape, reporting a mismatched example input in the reader's terms.
+
+    Symbolic tracing has already succeeded by this point, so the failure is never about the model: it is about the
+    tensor handed in. Left uncaught it surfaces as six lines of fx internals, an ``nn_module_stack`` repr, and a stack
+    through four torch files, with the word ``torchdiagram`` nowhere in it and nothing saying that the fix is to change
+    the input shape — which is the single likeliest mistake a first-time user makes.
+
+    Args:
+        graph_module: The traced graph module.
+        args: One example tensor per ``forward()`` argument.
+
+    Raises:
+        ValueError: If ``args`` cannot be run through the model, naming the layer that rejected them and why.
+    """
+    propagation = _ShapeProp(graph_module)
+    try:
+        # ShapeProp.run_node calls traceback.print_exc() before re-raising, so the stack it prints reaches stderr
+        # whatever the caller does with the exception. Redirecting is the only way to keep the error to one line.
+        with redirect_stderr(io.StringIO()):
+            propagation.propagate(*args)
+    except Exception as error:
+        shapes = ", ".join(str(tuple(tensor.shape)) for tensor in args)
+        raise ValueError(
+            f"example input {shapes} does not run through this model: {_blame(graph_module, propagation.current)} "
+            f"rejected it — {_root_cause(error)}"
+        ) from error
+
+
+def _blame(graph_module: torch.fx.GraphModule, fx_node: torch.fx.Node | None) -> str:
+    """Name the step that rejected the example input, as a layer where there is one."""
+    if fx_node is None:
+        return "the model"
+    if fx_node.op == "call_module":
+        return f"layer {fx_node.target!r} ({type(graph_module.get_submodule(str(fx_node.target))).__name__})"
+    return f"{fx_node.op.replace('_', ' ')} {fx_node.name!r}"
+
+
+def _root_cause(error: BaseException) -> str:
+    """The innermost message in an exception chain, which is the one that says what was actually wrong."""
+    cause: BaseException = error
+    while cause.__cause__ is not None:
+        cause = cause.__cause__
+    return str(cause).strip().splitlines()[0]
 
 
 def _tuple_unpacking(
