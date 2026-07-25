@@ -7,6 +7,7 @@ import sys
 import pytest
 
 import torchdiagram as td
+from torchdiagram.renderers.layout import place
 
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
@@ -149,3 +150,65 @@ def test_render_validates_graph(tmp_path):
     bad = td.Graph(nodes=[td.Node(id="a", op="custom", label="a")], edges=[td.Edge("a", "ghost")])
     with pytest.raises(ValueError, match="unknown node id"):
         td.render(bad, tmp_path / "model.svg")
+
+
+def branching_graph() -> td.Graph:
+    """Build a graph whose input fans out to three branches that reconverge on one node."""
+    nodes = [td.Node(id="x", op="input", label="input")]
+    edges = []
+    for index in range(3):
+        nodes.append(td.Node(id=f"b{index}", op="conv2d", label="Conv2d"))
+        edges += [td.Edge("x", f"b{index}"), td.Edge(f"b{index}", "join")]
+    nodes += [td.Node(id="join", op="cat", label="cat"), td.Node(id="out", op="output", label="output")]
+    edges.append(td.Edge("join", "out"))
+    return td.Graph(name="branches", nodes=nodes, edges=edges)
+
+
+def chained_skips_graph(count: int) -> td.Graph:
+    """Build a chain of residual blocks, each skipping over one node, so no two skips overlap."""
+    nodes = [td.Node(id="x", op="input", label="input")]
+    edges = []
+    previous = "x"
+    for index in range(count):
+        body, join = f"body{index}", f"add{index}"
+        nodes += [td.Node(id=body, op="linear", label="Linear"), td.Node(id=join, op="add", label="add")]
+        edges += [td.Edge(previous, body), td.Edge(body, join), td.Edge(previous, join)]
+        previous = join
+    return td.Graph(name="skips", nodes=nodes, edges=edges)
+
+
+def test_layout_puts_parallel_branches_side_by_side():
+    """Branches that can run at once share a row, so the structure reads as a fan rather than as a chain."""
+    grid = place(branching_graph())
+    assert grid.width == 3
+    assert len({grid.rows[f"b{index}"] for index in range(3)}) == 1
+    assert len({grid.columns[f"b{index}"] for index in range(3)}) == 3
+
+
+def test_layout_keeps_a_chain_in_one_column():
+    """A model that really is a chain is laid out exactly as before: one node per row, one column."""
+    grid = place(demo_graph())
+    assert grid.width == 1
+    assert sorted(grid.rows.values()) == [0, 1, 2, 3]
+
+
+def test_layout_reuses_a_lane_once_its_edge_has_landed():
+    """Lane count tracks how many skip edges are in flight at once, not how many the model has."""
+    assert place(chained_skips_graph(8)).lane_count == 1
+
+
+def test_svg_width_does_not_grow_with_the_number_of_skip_edges():
+    """Twenty non-overlapping residuals take the same canvas width as two."""
+    assert svg_size(td.to_svg(chained_skips_graph(2)))[0] == svg_size(td.to_svg(chained_skips_graph(20)))[0]
+
+
+def test_tikz_node_names_are_sanitized():
+    """A node id is an internal handle; put verbatim into a TikZ name, a dot in one reads as a node anchor."""
+    graph = td.Graph(
+        nodes=[td.Node(id="a.b", op="input", label="in"), td.Node(id="c,d", op="output", label="out")],
+        edges=[td.Edge("a.b", "c,d")],
+    )
+    tikz = td.to_tikz(graph)
+    assert "(a.b)" not in tikz
+    assert "(c,d)" not in tikz
+    assert r"\draw[arrow] (td0) -- (td1);" in tikz

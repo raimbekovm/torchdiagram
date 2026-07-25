@@ -2,12 +2,16 @@
 
 The output is a standalone document: compile it directly with pdflatex/tectonic, or copy the ``tikzpicture``
 environment into a paper. No LaTeX toolchain is required to generate the file itself.
+
+Nodes are placed at absolute grid coordinates from :mod:`torchdiagram.renderers.layout`, so parallel branches sit side
+by side here exactly as they do in the SVG.
 """
 
 from __future__ import annotations
 
 from torchdiagram.graph import Graph, Node
 from torchdiagram.renderers._format import length
+from torchdiagram.renderers.layout import place
 from torchdiagram.theme import DEFAULT, Theme
 
 # Theme color fields mapped to the xcolor names emitted into the preamble.
@@ -31,6 +35,9 @@ _ESCAPES = {
     **{char: f"\\{char}" for char in "{}_#&$%"},
 }
 
+_COLUMN_MM = 42  # horizontal step between grid columns, wider than the 32mm minimum node width
+_ROW_MM = 15  # vertical step between grid rows
+
 
 def to_tikz(graph: Graph, *, theme: Theme = DEFAULT) -> str:
     """Render ``graph`` as a standalone LaTeX/TikZ document string.
@@ -43,24 +50,38 @@ def to_tikz(graph: Graph, *, theme: Theme = DEFAULT) -> str:
     Returns:
         A complete, compilable LaTeX document as a string. Labels are escaped for LaTeX.
     """
-    index = {node.id: i for i, node in enumerate(graph.nodes)}
+    grid = place(graph)
+    names = _names(graph)
     lines = _preamble(theme)
 
-    previous = None
     for node in graph.nodes:
         style = "io" if node.is_io else "block"
-        placement = f", below=of {previous}" if previous else ""
-        lines.append(rf"\node[{style}{placement}] ({node.id}) {{{_node_text(node)}}};")
-        previous = node.id
+        x = grid.columns[node.id] * _COLUMN_MM
+        y = -grid.rows[node.id] * _ROW_MM
+        lines.append(rf"\node[{style}] ({names[node.id]}) at ({x}mm,{y}mm) {{{_node_text(node)}}};")
 
     for edge in graph.edges:
-        if index[edge.target] - index[edge.source] == 1:
-            lines.append(rf"\draw[arrow] ({edge.source}) -- ({edge.target});")
+        source, target = names[edge.source], names[edge.target]
+        if grid.is_straight(edge.source, edge.target):
+            lines.append(rf"\draw[arrow] ({source}) -- ({target});")
         else:
-            lines.append(rf"\draw[arrow] ({edge.source}.east) to[bend left=60] ({edge.target}.east);")
+            # Bend proportionally to the lane, so two long skips over the same rows do not trace the same curve.
+            bend = 30 + 10 * min(grid.lanes[(edge.source, edge.target)], 5)
+            lines.append(rf"\draw[arrow] ({source}.east) to[bend left={bend}] ({target}.east);")
 
     lines += [r"\end{tikzpicture}", r"\end{document}", ""]
     return "\n".join(lines)
+
+
+def _names(graph: Graph) -> dict[str, str]:
+    """Map each node id to a TikZ node name that TikZ will read as one name.
+
+    Node ids are internal handles and never appear in the output, but they used to be dropped into the node name
+    verbatim. In TikZ ``(a.b)`` is not a node called ``a.b``; it is node ``a``, anchor ``b``, so an id carrying a dot —
+    the natural thing for a frontend using dotted module paths — compiles to the wrong reference or not at all. Commas,
+    pipes, and a leading digit break the same way. Numbering sidesteps all of it.
+    """
+    return {node.id: f"td{index}" for index, node in enumerate(graph.nodes)}
 
 
 def _preamble(theme: Theme) -> list[str]:

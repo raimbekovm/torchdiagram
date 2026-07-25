@@ -179,7 +179,11 @@ png_bytes = td.to_png(graph)
 
 ### SVG output
 
-The SVG renderer produces a self-contained document with no external references. Nodes are laid out in a single vertical column in execution order; adjacent nodes are connected with straight arrows, and skip connections are routed as curves to the right of the column. Input and output nodes are styled distinctly from computation blocks.
+The SVG renderer produces a self-contained document with no external references. Input and output nodes are styled distinctly from computation blocks.
+
+Layout puts each node one row below the last of its inputs, so nodes that can run at once share a row and are drawn side by side: an inception module's four branches, a detection head's three pyramid levels, and a U-Net's two paths read as the parallel structures they are rather than as a chain with skip connections. A model that really is a chain gets one node per row in one column, as before. Arrows between neighbouring rows are straight, and so is an arrow reaching further down its own column past nothing at all; anything else is routed as a curve in a lane to the right.
+
+Lanes are reused as soon as an edge has landed, so the canvas width tracks how many curves are in flight at once rather than how many the model has in total. Unaggregated GPT-2, whose 168 residuals used to make a 4735 px wide figure, comes out 829 px wide.
 
 The file can be opened in any browser, embedded in HTML or Markdown, and edited in vector graphics software such as Inkscape.
 
