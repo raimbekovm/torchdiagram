@@ -143,6 +143,27 @@ def result_keys(count: int, structure: str | None, names: Sequence[str] | None) 
     return [str(index) for index in range(count)]
 
 
+def class_name(cls: object) -> str:
+    """Name the class recorded on an ``nn_module_stack`` entry, which fx stores as an object and export as a string."""
+    return cls.rsplit(".", 1)[-1] if isinstance(cls, str) else getattr(cls, "__name__", str(cls))
+
+
+def record_scopes(entries: Sequence[tuple[str, object]], scopes: dict[str, str]) -> None:
+    """Note every container on a node's ``nn_module_stack``, not just the one it reports as its scope.
+
+    A level that owns no operation of its own — a bare ``nn.Sequential`` between two custom modules — is never any
+    node's ``scope``, so a map built from the nodes alone has a hole exactly there, and aggregation dead-ends at it. The
+    stack knows the whole chain, so recording all of it fills the hole in.
+
+    Args:
+        entries: The node's ``nn_module_stack`` entries as ``(path, class)`` pairs.
+        scopes: Accumulating path-to-class-name map. Modified in place.
+    """
+    for path, cls in entries:
+        if path:
+            scopes[path] = class_name(cls)
+
+
 def unique_id(candidate: str, used: set[str]) -> str:
     """Return ``candidate``, suffixed if needed, so node ids stay unique; records it in ``used``."""
     node_id = candidate

@@ -108,9 +108,19 @@ into a single node instead, labeled e.g. `"BasicBlock ×5"`. Because the deepest
 transformer block's own node sequence becomes short and uniform once its attention/MLP contents are
 collapsed, which is what lets the stack of blocks itself then merge into one `"TransformerBlock ×N"` node —
 no attention-specific code involved, just the same scope+structure rule applied one nesting level at a time.
-This outer merge relies on the block having at least one op of its own at that scope (a residual `add` is the
-common case); a container that does nothing but call its children collapses its contents fine but won't merge
-across repeats itself — see [design.md](design.md#block-aggregation).
+
+Two things fall out of "the submodule a node was traced from" that the rule above does not cover on its own. A
+leaf layer reports the container holding it, not itself, so a stack of N identical `nn.TransformerEncoderLayer`
+in one `nn.Sequential` is a single group with nothing inside it to compare — those runs are found first and
+badged `"TransformerEncoderLayer ×N"` before any grouping. And a container that owns no operation of its own,
+a bare `nn.Sequential` between two custom modules, appears as nobody's scope; `Graph.scopes` records the whole
+module chain so the walk does not stop there. Such a container is unwrapped rather than collapsed when it holds
+nothing but already-collapsed blocks, since naming it after its attribute would say less than the boxes
+already do.
+
+A block whose `forward()` does nothing but call its children owns no operation at its own scope, and used to
+stop there for the same reason a bare container did; `Graph.scopes` covers both, so `PassThrough ×3` comes out
+as a count rather than a single unbadged box — see [design.md](design.md#block-aggregation).
 
 Only exact matches merge, and the badge is a claim the transform has to be able to back. Two neighboring groups
 merge into one `×N` node only when three things agree: their op sequence and internal wiring, the configuration

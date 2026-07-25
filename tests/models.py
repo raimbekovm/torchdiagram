@@ -137,6 +137,59 @@ class MixedDepthStack(nn.Module):
         return self.stage2(self.stage1(x))
 
 
+class WideningBlock(nn.Module):
+    """Holds its convolutions in a bare ``nn.Sequential`` one level down, which no operation is traced from."""
+
+    def __init__(self) -> None:
+        """Initialize two convolutions of unequal width inside a Sequential."""
+        super().__init__()
+        self.layers = nn.Sequential(nn.Conv2d(3, 4, 3, padding=1), nn.Conv2d(4, 8, 3, padding=1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the convolution stack."""
+        return self.layers(x)
+
+
+class ThreeLevelNet(nn.Module):
+    """A custom block around a bare ``nn.Sequential`` around leaf layers — the nesting torchvision models use."""
+
+    def __init__(self) -> None:
+        """Initialize the block and the pooling head."""
+        super().__init__()
+        self.block = WideningBlock()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the block, then pool."""
+        return self.pool(self.block(x))
+
+
+class DelegatingBlock(nn.Module):
+    """Its ``forward()`` only calls its children, so no operation is ever traced at its own scope."""
+
+    def __init__(self) -> None:
+        """Initialize the layer stack."""
+        super().__init__()
+        self.layers = nn.Sequential(nn.Linear(8, 8), nn.ReLU())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the layer stack."""
+        return self.layers(x)
+
+
+class DelegatingStack(nn.Module):
+    """Three identical delegating blocks — repeats a level that owns no operation has to keep countable."""
+
+    def __init__(self, num_blocks: int = 3) -> None:
+        """Initialize the stack of delegating blocks."""
+        super().__init__()
+        self.blocks = nn.Sequential(*[DelegatingBlock() for _ in range(num_blocks)])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run every block in sequence."""
+        return self.blocks(x)
+
+
 class ClassifierHead(nn.Module):
     """A model whose head is a bare ``nn.Sequential``, whose class name says nothing about what it does."""
 

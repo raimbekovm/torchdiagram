@@ -82,11 +82,16 @@ class Graph:
         name: Diagram title.
         nodes: Nodes in execution order.
         edges: Directed data-flow edges.
+        scopes: Every container module the traced nodes sit under, as dotted path mapped to class name — including the
+            levels that own no operation of their own, such as a bare ``nn.Sequential`` between two custom modules.
+            Those levels appear as no node's ``scope``, so without this map the module tree has holes in it and
+            :func:`torchdiagram.transforms.aggregate_blocks` cannot walk past them. Empty for a hand-built graph.
     """
 
     name: str = "model"
     nodes: list[Node] = field(default_factory=list)
     edges: list[Edge] = field(default_factory=list)
+    scopes: dict[str, str] = field(default_factory=dict)
 
     def validate(self) -> None:
         """Check internal consistency of the graph.

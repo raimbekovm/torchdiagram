@@ -7,7 +7,7 @@ hand-built ones alike, and require no changes to the renderers.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .graph import Edge, Graph, Node, scope_leaf
 
@@ -55,13 +55,127 @@ def aggregate_blocks(graph: Graph, *, min_repeats: int = 2) -> Graph:
     """
     nodes, edges = list(graph.nodes), list(graph.edges)
     structure: dict[str, str] = {}  # synthetic node id -> digest of everything that node collapsed
+    path_class = {**graph.scopes}
+    path_class.update({node.scope: node.scope_class for node in nodes if node.scope and node.scope_class})
+
+    nodes, edges = _collapse_repeats(nodes, edges, min_repeats, structure)
     max_depth = max((_depth(node.scope) for node in nodes if node.scope is not None), default=0)
     for depth in range(max_depth, 0, -1):
-        nodes, edges = _aggregate_one_level(nodes, edges, depth, min_repeats, structure)
+        nodes, edges = _aggregate_one_level(nodes, edges, depth, min_repeats, structure, path_class)
 
-    result = Graph(name=graph.name, nodes=nodes, edges=edges)
+    result = Graph(name=graph.name, nodes=nodes, edges=edges, scopes=dict(graph.scopes))
     result.validate()
     return result
+
+
+def _collapse_repeats(
+    nodes: list[Node], edges: list[Edge], min_repeats: int, structure: dict[str, str]
+) -> tuple[list[Node], list[Edge]]:
+    """Badge a run of adjacent interchangeable layers held in one container as a single node.
+
+    A stack of N identical layers held directly in an ``nn.Sequential`` — four ``nn.TransformerEncoderLayer``, a CNN of
+    convolutions at one width — is a single group to :func:`_segment_by_scope`, because a leaf layer reports the
+    container holding it rather than itself, so all N siblings share one ``scope``. :func:`_merge_runs` only ever
+    compares whole groups against each other, so the repetition *inside* one group was invisible and the whole stack
+    came out as one box named after the attribute, with nothing saying how many layers went into it. A hand-written
+    block gets this right only because each instance carries its own ``scope``.
+
+    Runs are found before any grouping, so what the level above sees is already one badged node.
+
+    Args:
+        nodes: Nodes in execution order.
+        edges: Data-flow edges.
+        min_repeats: Minimum run length required to badge; shorter runs are left as they are.
+        structure: Digest registry, extended with an entry per node created here.
+
+    Returns:
+        The nodes and edges with each qualifying run replaced by one node.
+    """
+    incoming, outgoing = _edge_index(edges)
+    new_nodes: list[Node] = []
+    collapsed: dict[str, str] = {}
+    index = 0
+    while index < len(nodes):
+        end = index + 1
+        while (
+            end < len(nodes)
+            and _interchangeable(nodes[index], nodes[end], structure)
+            and _links_only(nodes[end - 1], nodes[end], incoming, outgoing)
+        ):
+            end += 1
+        run = nodes[index:end]
+        if len(run) >= min_repeats and _repeatable(nodes[index]):
+            synthetic = _synthesize_run(run, structure)
+            new_nodes.append(synthetic)
+            collapsed.update({node.id: synthetic.id for node in run})
+        else:
+            new_nodes.extend(run)
+        index = end
+    return new_nodes, _rewire(edges, collapsed)
+
+
+def _edge_index(edges: list[Edge]) -> tuple[dict[str, list[Edge]], dict[str, list[Edge]]]:
+    """Index ``edges`` by target and by source."""
+    incoming: dict[str, list[Edge]] = {}
+    outgoing: dict[str, list[Edge]] = {}
+    for edge in edges:
+        incoming.setdefault(edge.target, []).append(edge)
+        outgoing.setdefault(edge.source, []).append(edge)
+    return incoming, outgoing
+
+
+def _repeatable(node: Node) -> bool:
+    """Whether ``node`` is a layer inside a container, which is the only thing a repeat count can be claimed about."""
+    return node.scope is not None and node.scope_class is not None and node.op != "block"
+
+
+def _interchangeable(first: Node, second: Node, structure: dict[str, str]) -> bool:
+    """Whether two nodes are the same layer twice: same container, same operation, same configuration."""
+    return (
+        first.scope == second.scope
+        and first.scope_class == second.scope_class
+        and _op_key(first, structure) == _op_key(second, structure)
+    )
+
+
+def _links_only(previous: Node, node: Node, incoming: dict[str, list[Edge]], outgoing: dict[str, list[Edge]]) -> bool:
+    """Whether the flow goes from ``previous`` straight into ``node`` and nowhere else on either side."""
+    return [edge.target for edge in outgoing.get(previous.id, [])] == [node.id] and [
+        edge.source for edge in incoming.get(node.id, [])
+    ] == [previous.id]
+
+
+def _synthesize_run(run: list[Node], structure: dict[str, str]) -> Node:
+    """Build the badged node that replaces a run of repeated sibling layers."""
+    first = run[0]
+    repeats = len(run)
+    name = first.label.partition(" (")[0]  # drop the attribute qualifier; the run covers several attributes
+    signature: _Signature = ((_op_key(first, structure),), ((),), (True,))
+    node = Node(
+        id=f"{first.id}__agg",
+        op="block",
+        label=f"{name} ×{repeats}",
+        params={"repeats": repeats, "block_class": name, "ops_per_repeat": 1},
+        output_shape=run[-1].output_shape,
+        scope=first.scope,
+        scope_class=first.scope_class,
+    )
+    structure[node.id] = _fingerprint(name, repeats, signature)
+    return node
+
+
+def _rewire(edges: list[Edge], collapsed: dict[str, str]) -> list[Edge]:
+    """Redirect ``edges`` onto the nodes that replaced their endpoints, dropping self-edges and duplicates."""
+    rewired: list[Edge] = []
+    seen: set[tuple[str, str]] = set()
+    for edge in edges:
+        source = collapsed.get(edge.source, edge.source)
+        target = collapsed.get(edge.target, edge.target)
+        if source == target or (source, target) in seen:
+            continue
+        seen.add((source, target))
+        rewired.append(Edge(source=source, target=target))
+    return rewired
 
 
 def _depth(scope: str) -> int:
@@ -76,17 +190,16 @@ def _parent_scope(scope: str) -> str | None:
 
 
 def _aggregate_one_level(
-    nodes: list[Node], edges: list[Edge], target_depth: int, min_repeats: int, structure: dict[str, str]
+    nodes: list[Node],
+    edges: list[Edge],
+    target_depth: int,
+    min_repeats: int,
+    structure: dict[str, str],
+    path_class: dict[str, str],
 ) -> tuple[list[Node], list[Edge]]:
     """Collapse eligible scope groups at exactly ``target_depth``, leaving other depths untouched."""
-    incoming: dict[str, list[Edge]] = {}
-    outgoing: dict[str, list[Edge]] = {}
-    for edge in edges:
-        incoming.setdefault(edge.target, []).append(edge)
-        outgoing.setdefault(edge.source, []).append(edge)
-
-    path_class = {node.scope: node.scope_class for node in nodes if node.scope is not None}
-    segments = _segment_by_scope(nodes, target_depth)
+    incoming, outgoing = _edge_index(edges)
+    segments = _unwrap_containers(_segment_by_scope(nodes, target_depth), path_class)
     items = _merge_runs(segments, incoming, outgoing, structure)
 
     new_nodes: list[Node] = []
@@ -105,17 +218,36 @@ def _aggregate_one_level(
             for group in run:
                 for node in group.nodes:
                     collapsed[node.id] = synthetic.id
+    return new_nodes, _rewire(edges, collapsed)
 
-    new_edges: list[Edge] = []
-    seen: set[tuple[str, str]] = set()
-    for edge in edges:
-        source = collapsed.get(edge.source, edge.source)
-        target = collapsed.get(edge.target, edge.target)
-        if source == target or (source, target) in seen:
-            continue
-        seen.add((source, target))
-        new_edges.append(Edge(source=source, target=target))
-    return new_nodes, new_edges
+
+def _unwrap_containers(segments: list[Node | _Group], path_class: dict[str, str]) -> list[Node | _Group]:
+    """Let a bare container holding nothing but collapsed blocks pass through to the level above.
+
+    Collapsing it would replace boxes that name themselves — ``BasicBlock ×4``, ``DenseLayer`` — with one named after
+    the attribute holding them, ``layer1``, which says strictly less. Its children are lifted to the parent scope
+    instead, so the walk continues upward and a real class one level up (``DenseBlock``) still gets its box. A container
+    holding raw operations is a different case and still collapses: ``classifier`` is the only name those three layers
+    have.
+
+    Args:
+        segments: Output of :func:`_segment_by_scope`.
+        path_class: Every scope path mapped to its class name.
+
+    Returns:
+        The segments with such groups replaced by their nodes, rescoped one level up.
+    """
+    unwrapped: list[Node | _Group] = []
+    for segment in segments:
+        if not isinstance(segment, _Group) or segment.scope_class not in _CONTAINERS:
+            unwrapped.append(segment)
+        elif all(node.op == "block" for node in segment.nodes):
+            parent = _parent_scope(segment.scope)
+            scope_class = path_class.get(parent) if parent is not None else None
+            unwrapped.extend(replace(node, scope=parent, scope_class=scope_class) for node in segment.nodes)
+        else:
+            unwrapped.append(segment)
+    return unwrapped
 
 
 def _segment_by_scope(nodes: list[Node], target_depth: int) -> list[Node | _Group]:
@@ -168,6 +300,9 @@ def _merge_runs(
                 not isinstance(candidate, _Group)
                 or not _eligible(candidate, incoming, outgoing)
                 or candidate.scope_class != segment.scope_class
+                # Siblings only: merging `blocks.0.layers` with `blocks.1.layers` would put one node under one
+                # arbitrary parent, and the repeat count belongs one level up, where the parents themselves repeat.
+                or _parent_scope(candidate.scope) != _parent_scope(segment.scope)
                 or _signature(candidate, incoming, structure) != signature
             ):
                 break

@@ -28,8 +28,10 @@ from .frontend import (
     append_outputs,
     as_args,
     build_edges,
+    class_name,
     normalize_label,
     qualify_labels,
+    record_scopes,
     result_keys,
     unique_id,
 )
@@ -157,6 +159,7 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
     results: list[tuple[str | None, torch.fx.Node]] = []
 
     for fx_node in graph_module.graph.nodes:
+        record_scopes(_stack(fx_node), graph.scopes)
         if fx_node.op == "output":
             results = _results(graph_module, fx_node)
             continue
@@ -358,8 +361,7 @@ def _scope(entries: _Entries) -> tuple[str | None, str | None]:
     if not entries:
         return None, None
     path, cls = entries[-1]
-    # export records the class as a fully-qualified string, unlike fx, which records the class object itself.
-    return path, cls.rsplit(".", 1)[-1] if isinstance(cls, str) else getattr(cls, "__name__", str(cls))
+    return path, class_name(cls)
 
 
 def _stack(fx_node: torch.fx.Node) -> _Entries:

@@ -24,9 +24,11 @@ from .frontend import (
     append_outputs,
     as_args,
     build_edges,
+    class_name,
     leaf_root_graph,
     normalize_label,
     qualify_labels,
+    record_scopes,
     result_keys,
     unique_id,
 )
@@ -129,6 +131,7 @@ def _trace_fx(model: nn.Module, args: tuple[torch.Tensor, ...] | None, *, name: 
     used_ids: set[str] = set()
     results: list[tuple[str | None, torch.fx.Node]] = []
     for fx_node in graph_module.graph.nodes:
+        record_scopes(_stack(fx_node), graph.scopes)
         if fx_node in plumbing:
             continue
         if fx_node.op == "output":
@@ -329,13 +332,16 @@ def _scope(fx_node: torch.fx.Node) -> tuple[str | None, str | None]:
     Reads ``nn_module_stack``, which fx populates for every node kind (not just ``call_module``), so functional ops
     called from inside a submodule's ``forward()`` (e.g. a residual ``add``) still resolve to that submodule.
     """
-    stack = fx_node.meta.get("nn_module_stack")
-    if not stack:
-        return None, None
-    entries = list(stack.items())
+    entries = _stack(fx_node)
     if fx_node.op == "call_module":
         entries = entries[:-1]  # drop the node's own leaf module, keep its parent
     if not entries:
         return None, None
-    path, cls = entries[-1][1]
-    return path, cls.__name__
+    path, cls = entries[-1]
+    return path, class_name(cls)
+
+
+def _stack(fx_node: torch.fx.Node) -> list[tuple[str, object]]:
+    """Read ``nn_module_stack`` as ``(path, class)`` entries, outermost first."""
+    stack = fx_node.meta.get("nn_module_stack")
+    return list(stack.values()) if stack else []
