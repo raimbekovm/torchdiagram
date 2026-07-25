@@ -76,7 +76,8 @@ def trace_export(model: nn.Module, example_input: ExampleInput, *, name: str | N
         UserWarning: If the graph had to be specialized on ``example_input``, meaning branches that input does not take
             are missing from the diagram.
     """
-    graph_module, specialized = _export(model, as_args(example_input))
+    args = as_args(example_input)
+    graph_module, specialized = _export(model, args)
     if specialized:
         warnings.warn(
             f"{type(model).__name__} was traced with torch.export and specialized on the example input: branches "
@@ -84,7 +85,7 @@ def trace_export(model: nn.Module, example_input: ExampleInput, *, name: str | N
             UserWarning,
             stacklevel=2,
         )
-    return _build_graph(model, graph_module, as_args(example_input), name=name or type(model).__name__)
+    return _build_graph(model, graph_module, args, sound=not specialized, name=name or type(model).__name__)
 
 
 def _export(model: nn.Module, args: tuple[torch.Tensor, ...]) -> tuple[torch.fx.GraphModule, bool]:
@@ -146,7 +147,7 @@ def _quiet_export() -> Iterator[None]:
 
 
 def _build_graph(
-    model: nn.Module, graph_module: torch.fx.GraphModule, args: tuple[torch.Tensor, ...], *, name: str
+    model: nn.Module, graph_module: torch.fx.GraphModule, args: tuple[torch.Tensor, ...], *, sound: bool, name: str
 ) -> Graph:
     """Convert an exported graph module into the IR.
 
@@ -154,6 +155,7 @@ def _build_graph(
         model: The original module, used to resolve submodules by the paths recorded in ``nn_module_stack``.
         graph_module: Result of ``ExportedProgram.module()``.
         args: The example arguments the model was exported with, for re-exporting if a shape read has to be recovered.
+        sound: Whether ``graph_module`` came from a sound export rather than one specialized on ``args``.
         name: Diagram title.
 
     Returns:
@@ -244,7 +246,8 @@ def _build_graph(
 
     qualify_labels(graph.nodes, paths)
     graph.edges = build_edges(owner)
-    _reconnect_shape_reads(model, args, graph, origin, inputs)
+    if sound:
+        _reconnect_shape_reads(model, args, graph, origin, inputs)
     append_outputs(graph, owner, results, _shape, used_ids)
     return graph
 
@@ -264,9 +267,14 @@ def _reconnect_shape_reads(
 
     The dependency is recoverable, just not from this graph: exporting again with the input's dimensions marked dynamic
     leaves the read standing as a ``sym_size`` node, which names the placeholder it came from. That second export costs
-    as much as the first, so it is attempted only for a node that actually floats — which across the sixteen reference
-    architectures means one model, and no cost at all for the other fifteen. If it fails, or if the graphs cannot be
-    matched up, the diagram is left as it was.
+    as much as the first, so it is attempted only for a node that actually floats. Across the reference architectures
+    that means one model of fourteen, but the trigger is the symptom rather than the cause: a model that builds a
+    constant tensor in ``forward()`` (``torch.zeros(4, 1, 256)``) floats one too and pays for an attempt that cannot
+    help it. Narrowing further would mean guessing which constants came from a size, and guessing wrong loses an edge
+    the model really has. Callers on the specialized path skip this entirely — the sound export already failed for
+    them, and this one is the same call.
+
+    If the export fails, or the graphs cannot be matched up, the diagram is left as it was.
 
     Args:
         model: The module being traced.
@@ -304,13 +312,16 @@ def _export_dynamic(model: nn.Module, args: tuple[torch.Tensor, ...]) -> torch.f
         args: The example arguments it was exported with.
 
     Returns:
-        The exported graph module, or ``None`` if the torch build has no ``Dim.AUTO`` or the export failed.
+        The exported graph module, or ``None`` if the torch build has no ``Dim.AUTO``, an argument is not a tensor,
+        or the export failed.
     """
     auto = getattr(getattr(torch.export, "Dim", None), "AUTO", None)
     if auto is None:  # torch too old to ask for automatic dynamism
         return None
-    spec = tuple({axis: auto for axis in range(tensor.dim())} for tensor in args)
     try:
+        # Building the spec is inside the try as much as the export is: torch.export takes non-tensor arguments, and
+        # only a tensor has dimensions to mark. A recovery that cannot run has to leave the diagram alone, not raise.
+        spec = tuple({axis: auto for axis in range(tensor.dim())} for tensor in args)
         with _quiet_export(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
             return torch.export.export(model, args, dynamic_shapes=spec, strict=False).module()

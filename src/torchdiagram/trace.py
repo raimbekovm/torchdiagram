@@ -53,8 +53,11 @@ _METADATA_METHODS = frozenset({"size", "dim", "numel", "item", "element_size", "
 # fed a shape (`torch.arange(n)`, `x.view(b, -1)`) produces a tensor again and stays in the diagram.
 _SCALAR_MODULES = frozenset({"builtins", "operator", "_operator"})
 
-# Where torch itself lives, for telling its frames from the model's while walking the stack.
-_TORCH_ROOT = os.path.dirname(torch.__file__)
+# Where torch and this package live, for telling their frames from the model's while walking the stack. Both carry a
+# trailing separator, or `.../site-packages/torch` would also claim torchvision, torchaudio, and every other sibling
+# whose name starts the same way — and a torchvision model would have every frame of its own code skipped.
+_TORCH_ROOT = os.path.normcase(os.path.join(os.path.dirname(torch.__file__), ""))
+_SELF_ROOT = os.path.normcase(os.path.join(os.path.dirname(__file__), ""))
 
 
 def trace(
@@ -177,37 +180,54 @@ def _trace_fx(model: nn.Module, args: tuple[torch.Tensor, ...] | None, *, name: 
 
 
 class _LineTracer(torch.fx.Tracer):
-    """A tracer that notes which line of the model wrote each node.
+    """A tracer that notes where in the model each node was written.
 
-    The line is what tells ``x[0][1]`` from two subscripts written a line apart: both lower to the same pair of nodes,
-    so the graph alone cannot separate them, and the export frontend — which does record the line — folds the first into
+    That is what tells ``x[0][1]`` from two subscripts written a line apart: both lower to the same pair of nodes, so
+    the graph alone cannot separate them, and the export frontend — which does record the source — folds the first into
     one box. fx has to know the same thing to agree.
 
     ``torch.fx`` can supply it: setting ``record_stack_traces`` puts a formatted traceback on every node. It builds that
     by capturing and *formatting* a full stack per node, reading every source file it names, which takes tracing a GPT-2
     from 18 ms to 511 ms — measured on the first trace in a process, which is the only one a command-line run performs.
-    Only the innermost line outside torch is ever read here, and reading one frame costs nothing measurable.
+    Walking the frames without formatting them costs nothing measurable.
+
+    The value stored is ``torch.fx``'s ``stack_trace`` key but not its format: it is a compact ``path:line`` chain, and
+    torch's own ``_parse_stack_trace`` reads it as absent. Nothing outside this package sees the graph module, and only
+    :func:`~torchdiagram.frontend.continues_subscript` ever reads the key back.
     """
 
     def create_node(self, *args: object, **kwargs: object) -> torch.fx.Node:
-        """Create the node the base tracer would, tagged with the model line that produced it."""
+        """Create the node the base tracer would, tagged with the model code that produced it."""
         node = super().create_node(*args, **kwargs)  # type: ignore[arg-type]
-        node.meta["stack_trace"] = _source_line()
+        node.meta["stack_trace"] = _source_site()
         return node
 
 
-def _source_line() -> str | None:
-    """The innermost frame outside torch, as ``"path:line"``, or ``None`` if the stack never leaves torch.
+def _source_site() -> str | None:
+    """Where in the model a node was written, as a ``"path:line"`` chain innermost first, or ``None`` outside it.
 
-    fx only ever descends into code the user wrote — every ``torch.nn`` module is a leaf and is traced as a call, not
-    stepped through — so the first frame that is not torch's own is the line of ``forward()`` being traced.
+    The *chain* rather than the innermost frame, because a model is free to put a subscript in a helper — a submodule
+    applied twice, a function called from two places — and then every call of it reports the same innermost line. Two
+    genuinely separate operations would look like one and fold into a single box, which reads as the second submodule
+    doing nothing and the first producing a shape it never produced. The chain separates them by the call site, which is
+    what ``torch.export`` records and so what the two frontends have to agree on.
+
+    Frames inside torch are skipped rather than ending the walk, since torch sits between a module's ``__call__`` and
+    its ``forward()``. The walk stops at this package's own frames, above which there is no model left.
     """
-    frame: object = sys._getframe(2)  # 0 is this function, 1 is create_node, 2 is whoever asked for a node
-    while isinstance(frame, FrameType):
-        if not frame.f_code.co_filename.startswith(_TORCH_ROOT):
-            return f"{frame.f_code.co_filename}:{frame.f_lineno}"
+    try:
+        frame: FrameType | None = sys._getframe(2)  # 0 is this function, 1 is create_node, 2 is whoever asked
+    except ValueError:  # a stack too shallow to have a caller, which tracing never produces
+        return None
+    sites = []
+    while frame is not None:
+        path = os.path.normcase(frame.f_code.co_filename)
+        if path.startswith(_SELF_ROOT):
+            break
+        if not path.startswith(_TORCH_ROOT):
+            sites.append(f"{path}:{frame.f_lineno}")
         frame = frame.f_back
-    return None
+    return ";".join(sites) or None
 
 
 def _symbolic_trace(model: nn.Module) -> torch.fx.GraphModule:

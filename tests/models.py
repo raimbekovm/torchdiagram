@@ -593,3 +593,28 @@ class FixedRange(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Add a position embedding of a fixed length, then project."""
         return self.proj(x + self.pos(torch.arange(8)))
+
+
+class Slice(nn.Module):
+    """Drops the first item of whatever it is given — one subscript, in a submodule that gets applied twice."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return everything but the first item."""
+        return x[1:]
+
+
+class SlicedTwice(nn.Module):
+    """Applies the same one-subscript submodule twice, on two lines — two operations sharing one source line."""
+
+    def __init__(self) -> None:
+        """Initialize the two slicing steps and the projection."""
+        super().__init__()
+        self.first = Slice()
+        self.second = Slice()
+        self.proj = nn.Linear(4, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Slice twice, then project."""
+        first = self.first(x)
+        second = self.second(first)
+        return self.proj(second)

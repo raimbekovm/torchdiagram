@@ -23,6 +23,7 @@ from tests.models import (
     SequenceTagger,
     ShapeMath,
     SiameseTower,
+    SlicedTwice,
     StateOnlyTagger,
     SteppedSubscripts,
     SubscriptedLayer,
@@ -204,6 +205,7 @@ def test_single_return_keeps_one_plain_output_node():
         (ChainedSubscript(), torch.randn(3, 4, 4)),
         (SteppedSubscripts(), torch.randn(3, 4, 4)),
         (ShapeMath(), torch.randn(1, 8, 4)),
+        (SlicedTwice(), torch.randn(6, 4, 4)),
     ],
 )
 def test_both_frontends_emit_the_same_ir(model, example):
@@ -443,3 +445,20 @@ def test_a_range_of_a_fixed_size_is_left_unconnected():
     graph = td.trace(FixedRange(), torch.randn(1, 8, 4), backend="export")
     arange = next(node for node in graph.nodes if node.op == "arange")
     assert [edge for edge in graph.edges if edge.target == arange.id] == []
+
+
+def test_one_subscript_in_a_submodule_applied_twice_stays_two_boxes():
+    """Two calls of a slicing submodule are two operations, though both were written on the submodule's one line.
+
+    The source line alone cannot tell them apart, which is why the fold keys on the whole chain of model frames: the
+    call site differs even when the subscript does not. Collapsing them would attribute the second call's output to the
+    first submodule and leave the second doing nothing at all.
+    """
+    example = torch.randn(6, 4, 4)
+    for backend in ("fx", "export"):
+        graph = td.trace(SlicedTwice(), example, backend=backend)
+        index = [node for node in graph.nodes if node.op == "index"]
+        assert [(node.scope, node.output_shape) for node in index] == [
+            ("first", (5, 4, 4)),
+            ("second", (4, 4, 4)),
+        ], backend
