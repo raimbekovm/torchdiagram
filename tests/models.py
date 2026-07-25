@@ -380,6 +380,36 @@ class SubscriptedLayer(nn.Module):
         return self.conv(x)[0]
 
 
+class TokenPrefix(nn.Module):
+    """Mixes a learned token and a learned position embedding into the flow, the way a ViT does."""
+
+    def __init__(self) -> None:
+        """Initialize the projection, the class token, and the position embedding."""
+        super().__init__()
+        self.proj = nn.Linear(4, 4)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, 4))
+        self.pos_embed = nn.Parameter(torch.zeros(1, 4, 4))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Prepend the class token, add the position embedding, and project."""
+        x = torch.cat([self.cls_token.expand(x.shape[0], -1, -1), x], dim=1) + self.pos_embed
+        return self.proj(x)
+
+
+class SiameseTower(nn.Module):
+    """Applies one encoder to two inputs — two boxes on the diagram, one set of weights in the model."""
+
+    def __init__(self) -> None:
+        """Initialize the shared encoder and the scoring head."""
+        super().__init__()
+        self.encode = nn.Linear(4, 6)
+        self.score = nn.Linear(6, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode both halves of the input with the same layer and score their difference."""
+        return self.score(self.encode(x) - self.encode(x * 2))
+
+
 class DualEncoder(nn.Module):
     """Two towers scored against each other — a model whose ``forward()`` takes more than one tensor."""
 

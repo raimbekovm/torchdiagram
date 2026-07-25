@@ -76,7 +76,16 @@ def build_edges(owner: dict[torch.fx.Node, str]) -> list[Edge]:
 
 
 def _sources(fx_node: torch.fx.Node, owner: dict[torch.fx.Node, str]) -> list[str]:
-    """Ids of the kept nodes feeding ``fx_node``, looking through any dropped nodes in between."""
+    """Ids of the kept nodes feeding ``fx_node``, looking through dropped ones only when nothing else feeds it.
+
+    Looking through unconditionally reinstates the very dependency the plumbing pass exists to remove. ViT's
+    ``cls_token.expand(x.shape[0], -1, -1)`` takes its data from the class token and only its batch size from ``x``;
+    walking through the dropped shape lookup draws an arrow from the patch features into the class token, which says the
+    token is computed from them. When a node has a kept input of its own, that input is the answer.
+    """
+    direct = [owner[upstream] for upstream in fx_node.all_input_nodes if upstream in owner]
+    if direct:
+        return direct
     found: list[str] = []
     visited: set[torch.fx.Node] = set()
     queue = list(fx_node.all_input_nodes)
@@ -141,6 +150,28 @@ def result_keys(count: int, structure: str | None, names: Sequence[str] | None) 
     if structure == "dict" and names is not None and len(names) == count:
         return [str(name) for name in names]
     return [str(index) for index in range(count)]
+
+
+def parameter_node(model: torch.nn.Module, target: str, shape: tuple[int, ...] | None) -> Node:
+    """Build the box for a learned tensor the model uses directly in ``forward()``.
+
+    A ``Conv2d``'s weight belongs inside its layer's box and never surfaces. A class token, a position embedding, or a
+    causal mask referenced straight from ``forward()`` has nowhere else to live: dropping it leaves the addition it
+    feeds looking unary, and leaves the reader to guess where a tensor with no incoming edge came from.
+
+    Args:
+        model: The module the attribute belongs to.
+        target: Dotted attribute path, e.g. ``"cls_token"`` or ``"blocks.0.mask"``.
+        shape: The tensor's shape, when known.
+
+    Returns:
+        The IR node, named after the attribute and marked ``parameter`` or ``buffer`` by what it actually is.
+    """
+    attribute: object = model
+    for part in target.split("."):
+        attribute = getattr(attribute, part, None)
+    op = "parameter" if isinstance(attribute, torch.nn.Parameter) else "buffer"
+    return Node(id=target.replace(".", "_"), op=op, label=target.rpartition(".")[2], output_shape=shape)
 
 
 def class_name(cls: object) -> str:
@@ -242,6 +273,11 @@ def qualify_labels(nodes: list[Node], paths: dict[str, str]) -> None:
     share a label, each is qualified with its attribute name — ``Embedding (tok_emb)`` — and layers that are alone under
     their label keep the plain class name, which is what most of a diagram is.
 
+    Several boxes can also be one attribute rather than several: a siamese encoder applies one layer to two inputs, and
+    tied embeddings run one weight matrix twice. The data flow really does pass through twice, so both boxes are drawn,
+    but they are numbered ``Linear (a, call 1)`` / ``(a, call 2)`` and cross-referenced in ``params["shared_with"]`` so
+    the diagram does not claim two sets of weights where the model has one.
+
     Args:
         nodes: The IR nodes, labeled and in execution order. Modified in place.
         paths: Node id mapped to the dotted submodule path it was traced from, for module nodes only; functional nodes
@@ -252,8 +288,15 @@ def qualify_labels(nodes: list[Node], paths: dict[str, str]) -> None:
         if node.id in paths:
             groups.setdefault((node.scope, node.label), []).append(node)
     for group in groups.values():
-        names = [scope_leaf(paths[node.id]) for node in group]
-        if len(group) < 2 or len(set(names)) < len(group):
-            continue  # nothing to tell apart, or the attribute names don't tell them apart either
-        for node, name in zip(group, names, strict=True):
-            node.label = f"{node.label} ({name})"
+        if len(group) < 2:
+            continue  # a layer alone under its label needs nothing to tell it apart from
+        by_attribute: dict[str, list[Node]] = {}
+        for node in group:
+            by_attribute.setdefault(scope_leaf(paths[node.id]), []).append(node)
+        for name, calls in by_attribute.items():
+            if len(calls) == 1:
+                calls[0].label = f"{calls[0].label} ({name})"
+                continue
+            for index, node in enumerate(calls, start=1):
+                node.label = f"{node.label} ({name}, call {index})"
+                node.params = {**node.params, "shared_with": [call.id for call in calls if call is not node]}

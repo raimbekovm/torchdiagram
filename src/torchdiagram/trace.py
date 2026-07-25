@@ -27,6 +27,7 @@ from .frontend import (
     class_name,
     leaf_root_graph,
     normalize_label,
+    parameter_node,
     qualify_labels,
     record_scopes,
     result_keys,
@@ -303,8 +304,14 @@ def _to_ir(fx_node: torch.fx.Node, graph_module: torch.fx.GraphModule, used_ids:
     elif fx_node.op == "call_method":
         op = label = normalize_label(str(fx_node.target))
         node_id = unique_id(op, used_ids)
+    elif fx_node.op == "get_attr":
+        # fx only emits get_attr for an attribute the traced forward() reads itself; a layer's own weights stay inside
+        # its call_module node, so everything reaching here is a tensor the model uses in its own code.
+        node = parameter_node(graph_module, str(fx_node.target), _output_shape(fx_node))
+        used_ids.add(node.id)
+        return node
     else:
-        return None  # get_attr: parameter/buffer plumbing, not a diagram block
+        return None
 
     used_ids.add(node_id)
     scope, scope_class = _scope(fx_node)

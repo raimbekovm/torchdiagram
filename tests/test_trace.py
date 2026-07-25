@@ -15,8 +15,10 @@ from tests.models import (
     ResidualBlock,
     SequenceTagger,
     ShapeMath,
+    SiameseTower,
     SubscriptedLayer,
     TinyCNN,
+    TokenPrefix,
     UnusedBranch,
 )
 
@@ -187,6 +189,8 @@ def test_single_return_keeps_one_plain_output_node():
         (DualEncoder(), (torch.randn(1, 4), torch.randn(1, 8))),
         (PyramidHeads(), torch.randn(1, 3, 8, 8)),
         (ComposedEncoder(), torch.randn(1, 5, 8)),
+        (TokenPrefix(), torch.randn(1, 3, 4)),
+        (SiameseTower(), torch.randn(1, 4)),
         (CroppedHead(), torch.randn(1, 3, 5)),
     ],
 )
@@ -261,6 +265,33 @@ def test_subscripting_a_layers_tensor_output_stays_on_the_diagram():
 def test_tuple_unpacking_folds_without_an_example_input():
     """With no shapes to propagate, a layer selected from at two indices is still a tuple return."""
     assert [node.label for node in td.trace(SequenceTagger()).nodes] == ["input", "LSTM", "Linear", "output"]
+
+
+def test_a_parameter_used_in_forward_gets_its_own_box():
+    """A class token is a leaf of the data flow with nowhere else to live, so it is drawn rather than dropped."""
+    for backend in ("fx", "export"):
+        graph = td.trace(TokenPrefix(), torch.randn(1, 3, 4), backend=backend)
+        graph.validate()
+        incoming = {node.id: [edge.source for edge in graph.edges if edge.target == node.id] for node in graph.nodes}
+        assert [node.label for node in graph.nodes if node.op == "parameter"] == ["cls_token", "pos_embed"]
+        # An addition of a tensor and a learned embedding has two operands, not one.
+        assert sorted(incoming["add"]) == ["cat", "pos_embed"]
+
+
+def test_a_parameters_consumer_is_not_wired_to_whatever_supplied_a_shape():
+    """`cls_token.expand(x.shape[0], ...)` takes its data from the token; the batch size is not a data edge."""
+    graph = td.trace(TokenPrefix(), torch.randn(1, 3, 4))
+    expand = next(node for node in graph.nodes if node.op == "expand")
+    assert [edge.source for edge in graph.edges if edge.target == expand.id] == ["cls_token"]
+
+
+def test_a_layer_applied_twice_is_marked_as_one_set_of_weights():
+    """Two boxes for one layer is the honest picture of the data flow; claiming two sets of weights is not."""
+    for backend in ("fx", "export"):
+        graph = td.trace(SiameseTower(), torch.randn(1, 4), backend=backend)
+        shared = [node for node in graph.nodes if "shared_with" in node.params]
+        assert [node.label for node in shared] == ["Linear (encode, call 1)", "Linear (encode, call 2)"]
+        assert shared[0].params["shared_with"] == [shared[1].id]
 
 
 def test_export_graphs_still_aggregate():

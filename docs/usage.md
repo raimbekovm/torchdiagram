@@ -18,7 +18,10 @@ The trace records the actual data flow of `forward()`, so the diagram is derived
 - **Model inputs and outputs** become dedicated `input` and `output` nodes.
 - **Residual connections and parallel branches** appear as additional edges; a node may have any number of incoming and outgoing edges.
 
-Two kinds of node are internal plumbing and are excluded from the diagram: parameter and buffer accesses (`get_attr` in fx terms), and code that computes with a tensor's metadata rather than with the tensor. The second kind covers `x.shape[1]`, `x.size(0)`, and the arithmetic built on them — an attention head's `c // self.heads` is three nodes of it — none of which is an architecture step. What consumes them stays: `torch.arange(x.shape[1])` produces a real tensor, so the range is drawn, connected to the input the shape was read from.
+- **Learned tensors used directly in `forward()`** — a class token, a position embedding, a `register_buffer` causal mask — become `parameter` or `buffer` nodes labeled with the attribute name. A layer's own weights are not among them: they belong inside the layer's box and never surface.
+- **A layer applied more than once** is drawn once per call, since the data really does pass through twice. The boxes are numbered `Linear (encode, call 1)` / `(encode, call 2)` and list each other in `params["shared_with"]`, so the diagram does not read as two sets of weights.
+
+Code that computes with a tensor's metadata rather than with the tensor is internal plumbing and is excluded: `x.shape[1]`, `x.size(0)`, and the arithmetic built on them — an attention head's `c // self.heads` is three nodes of it — none of which is an architecture step. What consumes them stays: `torch.arange(x.shape[1])` produces a real tensor, so the range is drawn, connected to the input the shape was read from. A node that has a data input of its own is wired to that and nothing else, so `cls_token.expand(x.shape[0], -1, -1)` draws an arrow from the class token rather than from whatever the batch size was read off.
 
 ### Shape annotations
 

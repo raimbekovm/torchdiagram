@@ -30,6 +30,7 @@ from .frontend import (
     build_edges,
     class_name,
     normalize_label,
+    parameter_node,
     qualify_labels,
     record_scopes,
     result_keys,
@@ -150,13 +151,16 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
     """
     graph = Graph(name=name)
     owner: dict[torch.fx.Node, str] = {}  # every kept fx node, mapped to the IR node that represents it
-    by_module: dict[str, Node] = {}
-    members: dict[str, list[torch.fx.Node]] = {}  # submodule path -> the ATen ops it lowered to, in execution order
+    by_module: dict[str, Node] = {}  # submodule path -> the box its current, still-open run of ops draws as
+    members: dict[str, list[torch.fx.Node]] = {}  # box id -> the ATen ops it covers, in execution order
+    boxes: dict[str, Node] = {}  # box id -> the box, so a run's shape can be resolved after the walk
     used_ids: set[str] = set()
     paths: dict[str, str] = {}  # IR node id mapped to the submodule it came from, for label disambiguation
     plumbing = _plumbing(graph_module)
+    pending = _direct_parameters(model, graph_module, plumbing)  # parameter boxes, held back until first consumed
     indexing: dict[torch.fx.Node, Node] = {}  # indexing ops, mapped to the box the whole subscript draws as
     results: list[tuple[str | None, torch.fx.Node]] = []
+    open_path: str | None = None  # the layer whose run of ATen ops is still being collected
 
     for fx_node in graph_module.graph.nodes:
         record_scopes(_stack(fx_node), graph.scopes)
@@ -166,7 +170,7 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
         if fx_node.op == "placeholder":
             node = Node(id=unique_id(fx_node.name, used_ids), op="input", label="input", output_shape=_shape(fx_node))
         elif fx_node.op != "call_function" or fx_node in plumbing:
-            continue  # get_attr parameter plumbing, the synthetic _guards_fn module, and symbolic guard assertions
+            continue  # a layer's own weights, the synthetic _guards_fn module, and symbolic guard assertions
         else:
             path, module, ancestors = _leaf_module(model, _stack(fx_node))
             if module is None:
@@ -190,11 +194,12 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
                 )
                 if label == "index":
                     indexing[fx_node] = node
-            elif path in by_module:
+            elif path == open_path:
                 # A single layer can lower to several ATen ops (nn.MultiheadAttention becomes 28 of them); they all
-                # belong to one box, whose shape _group_shape() resolves once the whole group is known.
+                # belong to one box, whose shape _group_shape() resolves once the whole run is known. Only an unbroken
+                # run merges: a layer applied twice is two boxes, as it is under fx, not one box fed twice.
                 owner[fx_node] = by_module[path].id
-                members[path].append(fx_node)
+                members[by_module[path].id].append(fx_node)
                 continue
             else:
                 kind = type(module).__name__
@@ -210,18 +215,53 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
                     scope_class=scope_class,
                 )
                 by_module[path] = node
-                members[path] = [fx_node]
+                members[node.id] = [fx_node]
+                boxes[node.id] = node
                 paths[node.id] = path
+            open_path = path if module is not None else None
+        for upstream in fx_node.all_input_nodes:  # a parameter box appears just before the op that first reads it
+            parameter = pending.pop(upstream, None)
+            if parameter is not None:
+                owner[upstream] = parameter.id
+                graph.nodes.append(parameter)
         owner[fx_node] = node.id
         graph.nodes.append(node)
 
-    for path, node in by_module.items():
-        node.output_shape = _group_shape(members[path])
+    for node_id, run in members.items():
+        boxes[node_id].output_shape = _group_shape(run)
 
     qualify_labels(graph.nodes, paths)
     graph.edges = build_edges(owner)
     append_outputs(graph, owner, results, _shape)
     return graph
+
+
+def _direct_parameters(
+    model: nn.Module, graph_module: torch.fx.GraphModule, plumbing: set[torch.fx.Node]
+) -> dict[torch.fx.Node, Node]:
+    """Build a box for each learned tensor the model reads in its own code, keyed by the node that supplies it.
+
+    Export lifts every parameter to a ``get_attr``, a ``Conv2d``'s weight as much as a class token, so keeping them all
+    would put a box next to every layer. What separates the two is who reads it: a weight is read by an ATen op that
+    resolves back to the leaf layer it belongs inside, while a class token is read by functional code the model wrote
+    itself and has nowhere else to be drawn. That is the same set fx emits ``get_attr`` for.
+
+    Args:
+        model: The original module, for telling a parameter from a buffer.
+        graph_module: Result of ``ExportedProgram.module()``.
+        plumbing: Nodes already destined to be left out, whose reads do not count.
+
+    Returns:
+        Each qualifying ``get_attr`` node mapped to the box it draws as.
+    """
+    direct: dict[torch.fx.Node, Node] = {}
+    for fx_node in graph_module.graph.nodes:
+        if fx_node.op != "get_attr":
+            continue
+        readers = [user for user in fx_node.users if user.op == "call_function" and user not in plumbing]
+        if any(_leaf_module(model, _stack(user))[1] is None for user in readers):
+            direct[fx_node] = parameter_node(model, str(fx_node.target), _shape(fx_node))
+    return direct
 
 
 def _group_shape(members: list[torch.fx.Node]) -> tuple[int, ...] | None:
