@@ -26,20 +26,22 @@ Raises `torch.fx.proxy.TraceError` when no frontend can trace the model, and `Va
 
 Warns with `UserWarning` when the `torch.export` frontend had to specialize the graph on `example_input`, meaning branches that input does not take are absent from the diagram; see [data-dependent control flow](usage.md#data-dependent-control-flow).
 
-### `td.render(graph, path, *, theme=DEFAULT) -> Path`
+### `td.render(graph, path, *, theme=DEFAULT, scale=2.0) -> Path`
 
 Validate `graph` and write it to `path`, selecting the format from the file extension.
 
-| Extension       | Format                         |
-| --------------- | ------------------------------ |
-| `.svg`          | SVG image                      |
-| `.tex`, `.tikz` | Standalone TikZ/LaTeX document |
+| Extension       | Format                          |
+| --------------- | ------------------------------- |
+| `.svg`          | SVG image                       |
+| `.tex`, `.tikz` | Standalone TikZ/LaTeX document  |
+| `.png`          | Rasterized image, needs `[png]` |
 
-| Parameter | Type    | Description                                                               |
-| --------- | ------- | ------------------------------------------------------------------------- |
-| `theme`   | `Theme` | Colors and typography to apply. Defaults to `td.DEFAULT`. See `td.Theme`. |
+| Parameter | Type    | Description                                                                                       |
+| --------- | ------- | ------------------------------------------------------------------------------------------------- |
+| `theme`   | `Theme` | Colors and typography to apply. Defaults to `td.DEFAULT`. See `td.Theme`.                         |
+| `scale`   | `float` | Pixel scale factor for `.png` output, ignored by the vector formats. Default `2.0`. See `to_png`. |
 
-Returns the written path. Raises `ValueError` for an unsupported extension or an invalid graph (see `Graph.validate`).
+Returns the written path. Raises `ValueError` for an unsupported extension, an invalid graph (see `Graph.validate`), or a non-positive `scale`, and `ImportError` if `.png` output is requested without the optional rasterizer installed.
 
 ### `td.aggregate_blocks(graph, *, min_repeats=2) -> Graph`
 
@@ -59,6 +61,12 @@ Render `graph` as a self-contained SVG document string. Pure function; does not 
 ### `td.to_tikz(graph, *, theme=DEFAULT) -> str`
 
 Render `graph` as a standalone LaTeX/TikZ document string. Labels are escaped for LaTeX. Pure function; does not validate the graph or touch the filesystem. `theme` selects colors (emitted as `\definecolor` entries) and the two block lengths; the theme's `font_family` is ignored, since TikZ uses the LaTeX document font.
+
+### `td.to_png(graph, *, theme=DEFAULT, scale=2.0) -> bytes`
+
+Render `graph` as PNG image data: the SVG output rasterized at `scale` times its own pixel dimensions, on a transparent background. Pure function; does not validate the graph or touch the filesystem.
+
+Requires the optional rasterizer (`pip install 'torchdiagram[png]'`); without it, raises `ImportError` naming the extra. Raises `ValueError` if `scale` is not positive. See [PNG output](usage.md#png-output).
 
 ## Data classes
 
@@ -92,7 +100,7 @@ A single block in the diagram: a layer, a function call, or a graph input/output
 
 `op` values produced by the tracer: `"input"` and `"output"` for graph boundaries, the lowercased class name for submodule calls (`"conv2d"`, `"linear"`, `"maxpool2d"`, ...), and the function or method name for functional ops (`"relu"`, `"add"`, `"flatten"`, `"view"`, ...).
 
-**`Node.is_io -> bool`** — `True` for graph input/output nodes (`op` is `"input"` or `"output"`); both renderers use it to pick the distinct I/O box style.
+**`Node.is_io -> bool`** — `True` for graph input/output nodes (`op` is `"input"` or `"output"`); the SVG and TikZ renderers use it to pick the distinct I/O box style.
 
 ### `td.Edge`
 
@@ -105,7 +113,7 @@ A directed data-flow edge between two nodes.
 
 ### `td.Theme`
 
-Colors and typography for a rendered diagram, shared by both renderers. A frozen dataclass with no torch dependency; build a variant with `dataclasses.replace(td.DEFAULT, block_fill="#123456")`. All colors are hex strings.
+Colors and typography for a rendered diagram, shared by every renderer. A frozen dataclass with no torch dependency; build a variant with `dataclasses.replace(td.DEFAULT, block_fill="#123456")`. All colors are hex strings.
 
 | Field           | Type    | Default                                            | Description                                               |
 | --------------- | ------- | -------------------------------------------------- | --------------------------------------------------------- |

@@ -19,6 +19,12 @@ Or with uv:
 uv add git+https://github.com/raimbekovm/torchdiagram
 ```
 
+PNG output needs one optional dependency, a prebuilt rasterizer wheel. Add it with the `png` extra if you want it; SVG and TikZ work without it:
+
+```bash
+pip install 'torchdiagram[png] @ git+https://github.com/raimbekovm/torchdiagram'
+```
+
 Installing torchdiagram does not install or require a LaTeX distribution. LaTeX is only needed if you want to compile the generated `.tex` files yourself.
 
 ## A first diagram
@@ -45,9 +51,10 @@ class ResidualBlock(nn.Module):
 graph = td.trace(ResidualBlock(), torch.randn(1, 64, 56, 56))
 td.render(graph, "block.svg")  # SVG image
 td.render(graph, "block.tex")  # standalone TikZ/LaTeX document
+td.render(graph, "block.png")  # rasterized image, needs the [png] extra
 ```
 
-`block.svg` can be opened directly in a browser or embedded in HTML/Markdown. `block.tex` compiles as-is with `pdflatex` or `tectonic`, and its `tikzpicture` environment can be copied into an existing LaTeX document.
+`block.svg` can be opened directly in a browser or embedded in HTML/Markdown. `block.tex` compiles as-is with `pdflatex` or `tectonic`, and its `tikzpicture` environment can be copied into an existing LaTeX document. `block.png` is the same diagram rasterized, for slides and other places that won't display an SVG.
 
 The second argument to `trace()` is optional. When provided, torchdiagram runs shape propagation and annotates every node with its output shape; without it, the diagram shows the layer structure only.
 

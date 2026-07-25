@@ -5,7 +5,7 @@ The `torchdiagram` command traces a model given by an import path and writes a r
 ## Synopsis
 
 ```bash
-torchdiagram MODEL -o OUTPUT [--input-shape SHAPE] [--aggregate] [--min-repeats N] [--theme NAME] [--backend NAME]
+torchdiagram MODEL -o OUTPUT [--input-shape SHAPE] [--aggregate] [--min-repeats N] [--theme NAME] [--scale N] [--backend NAME]
 ```
 
 ## Arguments
@@ -13,11 +13,12 @@ torchdiagram MODEL -o OUTPUT [--input-shape SHAPE] [--aggregate] [--min-repeats 
 | Argument         | Required | Description                                                                                                                                                      |
 | ---------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `MODEL`          | yes      | Import path to the model in the form `package.module:attr`.                                                                                                      |
-| `-o`, `--output` | yes      | Output file. The format is selected by extension: `.svg`, `.tex`, or `.tikz`.                                                                                    |
+| `-o`, `--output` | yes      | Output file. The format is selected by extension: `.svg`, `.tex`, `.tikz`, or `.png`.                                                                            |
 | `--input-shape`  | no       | Comma-separated input shape, e.g. `1,3,224,224`. Enables output-shape annotations on every node.                                                                 |
 | `--aggregate`    | no       | Collapse scoped blocks — repeated (e.g. ResNet layers) and singleton (e.g. a transformer's attention/MLP sub-block) — into single labeled nodes. Off by default. |
 | `--min-repeats`  | no       | Minimum run length required to merge multiple blocks into one badged node with `--aggregate` (default: `2`); shorter runs still collapse individually.           |
 | `--theme`        | no       | Color theme: `default` (soft blue), `mono` (grayscale, for print), or `dark` (for dark backgrounds). Default: `default`.                                         |
+| `--scale`        | no       | Pixel scale factor for `.png` output (default: `2.0`); ignored by the vector formats. Requires `pip install 'torchdiagram[png]'`.                                |
 | `--backend`      | no       | Tracing frontend: `auto` (falls back to `torch.export` when `torch.fx` cannot trace the model), `fx`, or `export`. Default: `auto`.                              |
 
 ## Model specification
@@ -53,6 +54,9 @@ torchdiagram torchvision.models:resnet50 -o resnet50.svg --input-shape 1,3,224,2
 
 # Grayscale figure for a print paper
 torchdiagram torchvision.models:resnet18 -o resnet18.tex --input-shape 1,3,224,224 --theme mono
+
+# High-resolution PNG for a slide (needs the [png] extra)
+torchdiagram my_models:ResidualBlock -o block.png --input-shape 1,64,56,56 --scale 3
 ```
 
 ## Data-dependent control flow
