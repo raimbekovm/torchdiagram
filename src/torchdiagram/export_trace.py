@@ -29,6 +29,7 @@ from .frontend import (
     as_args,
     build_edges,
     class_name,
+    continues_subscript,
     normalize_label,
     parameter_node,
     qualify_labels,
@@ -177,7 +178,7 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
             call, path, module, ancestors = _leaf_module(model, _stack(fx_node))
             if module is None:
                 label = _label(fx_node.target)
-                continued = _continues_subscript(fx_node, label, indexing)
+                continued = continues_subscript(fx_node, label, indexing)
                 if continued is not None:
                     owner[fx_node] = continued.id
                     continued.output_shape = _shape(fx_node)
@@ -332,31 +333,6 @@ def _out_structure(spec: object) -> tuple[str | None, list[str] | None]:
     if kind in (tuple, list):
         return "tuple", None
     return None, None
-
-
-def _continues_subscript(fx_node: torch.fx.Node, label: str, indexing: dict[torch.fx.Node, Node]) -> Node | None:
-    """The box ``fx_node`` belongs to when it is another step of a subscript already being drawn.
-
-    ``x[:, 0, :-1]`` is one expression to a reader and one node to fx, but export lowers it per axis — a ``select`` and
-    then a ``slice``. Consecutive indexing ops that came from the same source line and feed nothing but each other are
-    that one expression, so they fold back into a single box. Two subscripts written on separate lines keep a box each,
-    which is what fx draws for them too.
-
-    Args:
-        fx_node: The node being converted.
-        label: Its normalized label.
-        indexing: Indexing nodes seen so far, mapped to the box each is drawn as.
-
-    Returns:
-        The box to extend, or ``None`` when this node starts one of its own.
-    """
-    if label != "index" or len(fx_node.all_input_nodes) != 1:
-        return None
-    source = fx_node.all_input_nodes[0]
-    if source not in indexing or len(source.users) != 1:
-        return None
-    line = fx_node.meta.get("stack_trace")
-    return indexing[source] if line is not None and line == source.meta.get("stack_trace") else None
 
 
 def _leaf_module(model: nn.Module, entries: _Entries) -> tuple[str, str, nn.Module | None, _Entries]:

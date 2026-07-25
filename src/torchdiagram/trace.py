@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import io
 import operator
+import os
+import sys
 from contextlib import redirect_stderr
+from types import FrameType
 
 import torch
 import torch.fx
@@ -27,6 +30,7 @@ from .frontend import (
     as_args,
     build_edges,
     class_name,
+    continues_subscript,
     leaf_root_graph,
     normalize_label,
     parameter_node,
@@ -48,6 +52,9 @@ _METADATA_METHODS = frozenset({"size", "dim", "numel", "item", "element_size", "
 # Plain Python arithmetic and indexing, the only operations metadata is allowed to spread through. A torch function
 # fed a shape (`torch.arange(n)`, `x.view(b, -1)`) produces a tensor again and stays in the diagram.
 _SCALAR_MODULES = frozenset({"builtins", "operator", "_operator"})
+
+# Where torch itself lives, for telling its frames from the model's while walking the stack.
+_TORCH_ROOT = os.path.dirname(torch.__file__)
 
 
 def trace(
@@ -123,7 +130,7 @@ def _trace_fx(model: nn.Module, args: tuple[torch.Tensor, ...] | None, *, name: 
             in ``forward()``.
         ValueError: If ``args`` cannot be run through the model, e.g. an example input with the wrong channel count.
     """
-    graph_module = torch.fx.symbolic_trace(model)
+    graph_module = _symbolic_trace(model)
     if args is not None:
         _propagate_shapes(graph_module, args)
 
@@ -133,6 +140,7 @@ def _trace_fx(model: nn.Module, args: tuple[torch.Tensor, ...] | None, *, name: 
     plumbing = _plumbing(graph_module)
     unpacking, unpacked_shapes = _tuple_unpacking(graph_module)
     used_ids: set[str] = set()
+    indexing: dict[torch.fx.Node, Node] = {}  # indexing ops, mapped to the box the whole subscript draws as
     results: list[tuple[str | None, torch.fx.Node]] = []
     for fx_node in graph_module.graph.nodes:
         record_scopes(_stack(fx_node), graph.scopes)
@@ -144,9 +152,17 @@ def _trace_fx(model: nn.Module, args: tuple[torch.Tensor, ...] | None, *, name: 
         if fx_node in unpacking:
             owner[fx_node] = owner[unpacking[fx_node]]  # the layer's box stands in for the unpacking
             continue
+        continued = continues_subscript(fx_node, _functional_label(fx_node), indexing)
+        if continued is not None:
+            owner[fx_node] = continued.id
+            continued.output_shape = _output_shape(fx_node)
+            indexing[fx_node] = continued
+            continue
         node = _to_ir(fx_node, graph_module, used_ids)
         if node is None:
             continue
+        if node.op == "index":
+            indexing[fx_node] = node
         if fx_node.op == "call_module":
             paths[node.id] = str(fx_node.target)
             if fx_node in unpacked_shapes:
@@ -158,6 +174,57 @@ def _trace_fx(model: nn.Module, args: tuple[torch.Tensor, ...] | None, *, name: 
     graph.edges = build_edges(owner)
     append_outputs(graph, owner, results, _output_shape, used_ids)
     return graph
+
+
+class _LineTracer(torch.fx.Tracer):
+    """A tracer that notes which line of the model wrote each node.
+
+    The line is what tells ``x[0][1]`` from two subscripts written a line apart: both lower to the same pair of nodes,
+    so the graph alone cannot separate them, and the export frontend — which does record the line — folds the first into
+    one box. fx has to know the same thing to agree.
+
+    ``torch.fx`` can supply it: setting ``record_stack_traces`` puts a formatted traceback on every node. It builds that
+    by capturing and *formatting* a full stack per node, reading every source file it names, which takes tracing a GPT-2
+    from 18 ms to 511 ms — measured on the first trace in a process, which is the only one a command-line run performs.
+    Only the innermost line outside torch is ever read here, and reading one frame costs nothing measurable.
+    """
+
+    def create_node(self, *args: object, **kwargs: object) -> torch.fx.Node:
+        """Create the node the base tracer would, tagged with the model line that produced it."""
+        node = super().create_node(*args, **kwargs)  # type: ignore[arg-type]
+        node.meta["stack_trace"] = _source_line()
+        return node
+
+
+def _source_line() -> str | None:
+    """The innermost frame outside torch, as ``"path:line"``, or ``None`` if the stack never leaves torch.
+
+    fx only ever descends into code the user wrote — every ``torch.nn`` module is a leaf and is traced as a call, not
+    stepped through — so the first frame that is not torch's own is the line of ``forward()`` being traced.
+    """
+    frame: object = sys._getframe(2)  # 0 is this function, 1 is create_node, 2 is whoever asked for a node
+    while isinstance(frame, FrameType):
+        if not frame.f_code.co_filename.startswith(_TORCH_ROOT):
+            return f"{frame.f_code.co_filename}:{frame.f_lineno}"
+        frame = frame.f_back
+    return None
+
+
+def _symbolic_trace(model: nn.Module) -> torch.fx.GraphModule:
+    """Symbolically trace ``model``, as ``torch.fx.symbolic_trace`` does but keeping each node's source line.
+
+    Args:
+        model: Module to trace.
+
+    Returns:
+        The traced graph module, every node's metadata carrying ``stack_trace``.
+
+    Raises:
+        torch.fx.proxy.TraceError: If ``model`` is not symbolically traceable.
+    """
+    tracer = _LineTracer()
+    graph = tracer.trace(model)
+    return torch.fx.GraphModule(tracer.root, graph, type(model).__name__)
 
 
 class _ShapeProp(ShapeProp):
@@ -401,11 +468,8 @@ def _to_ir(fx_node: torch.fx.Node, graph_module: torch.fx.GraphModule, used_ids:
         # Numbered off the submodule path, not off fx's own node name: fx strips a trailing `_<digits>` before
         # renumbering, so a second call of `body.0` becomes `body_2` there and `body_0_1` here.
         node_id = unique_id(str(fx_node.target).replace(".", "_"), used_ids)
-    elif fx_node.op == "call_function":
-        op = label = normalize_label(getattr(fx_node.target, "__name__", str(fx_node.target)))
-        node_id = unique_id(op, used_ids)
-    elif fx_node.op == "call_method":
-        op = label = normalize_label(str(fx_node.target))
+    elif fx_node.op in ("call_function", "call_method"):
+        op = label = _functional_label(fx_node)
         node_id = unique_id(op, used_ids)
     elif fx_node.op == "get_attr":
         # fx only emits get_attr for an attribute the traced forward() reads itself; a layer's own weights stay inside
@@ -427,6 +491,15 @@ def _to_ir(fx_node: torch.fx.Node, graph_module: torch.fx.GraphModule, used_ids:
         scope=scope,
         scope_class=scope_class,
     )
+
+
+def _functional_label(fx_node: torch.fx.Node) -> str:
+    """The label a non-module node draws under, normalized to the name the export frontend uses for it."""
+    if fx_node.op == "call_function":
+        return normalize_label(getattr(fx_node.target, "__name__", str(fx_node.target)))
+    if fx_node.op == "call_method":
+        return normalize_label(str(fx_node.target))
+    return ""
 
 
 def _output_shape(fx_node: torch.fx.Node) -> tuple[int, ...] | None:

@@ -102,6 +102,34 @@ def _sources(fx_node: torch.fx.Node, owner: dict[torch.fx.Node, str]) -> list[st
     return found
 
 
+def continues_subscript(fx_node: torch.fx.Node, label: str, indexing: dict[torch.fx.Node, Node]) -> Node | None:
+    """The box ``fx_node`` belongs to when it is another step of a subscript already being drawn.
+
+    Both tracers split a subscript, and they split it in different places. ``x[:, 0, :-1]`` is one node to fx and two to
+    export, which lowers a multi-axis subscript per axis; ``x[0][1]`` is one node to export, which cannot see the two
+    subscripts, and two to fx. Neither split is recoverable from the other graph — the ATen ops behind ``x[0, 1]`` and
+    ``x[0][1]`` are identical — so the two are made to agree by collapsing both: a run of indexing ops that came from
+    one source line and feed nothing but each other draws as one box, whichever tracer produced it.
+
+    Subscripts on separate lines keep a box each on both sides, which is what a reader wrote.
+
+    Args:
+        fx_node: The node being converted.
+        label: Its normalized label.
+        indexing: Indexing nodes seen so far, mapped to the box each is drawn as.
+
+    Returns:
+        The box to extend, or ``None`` when this node starts one of its own.
+    """
+    if label != "index" or len(fx_node.all_input_nodes) != 1:
+        return None
+    source = fx_node.all_input_nodes[0]
+    if source not in indexing or len(source.users) != 1:
+        return None
+    line = fx_node.meta.get("stack_trace")
+    return indexing[source] if line is not None and line == source.meta.get("stack_trace") else None
+
+
 def append_outputs(
     graph: Graph,
     owner: dict[torch.fx.Node, str],

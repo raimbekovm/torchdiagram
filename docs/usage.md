@@ -87,7 +87,8 @@ graph = td.trace(detector, torch.randn(1, 3, 256, 256))
 
 - **Non-tensor containers with dynamic contents** and some dynamic Python features inside `forward()` may not be traceable by either frontend.
 - A model the `torch.export` frontend also cannot handle surfaces the original `TraceError` from fx, since that error describes the model rather than the fallback.
-- Two places where the frontends still draw a different number of boxes, both about how a tracer records a dependency rather than how torchdiagram names it: subscripts *chained on one line* (`x[0][1]`) come out as two boxes under fx and one under export, and a range built from an input's shape (`torch.arange(x.shape[1])`) keeps its edge to the input under fx while export resolves it to a symbolic size with no dependency left to draw.
+- A run of subscripts written on one line (`x[0][1]`, `x[:, 0, :-1]`) draws as a single `index` box. Written as separate statements they draw as one box each, on both frontends — the source line is what tells the two apart.
+- One place where the frontends still draw a different number of edges: a range built from an input's shape (`torch.arange(x.shape[1])`) keeps its edge to the input under fx, while export resolves the shape to a constant and leaves no dependency to draw.
 
 Models that are fully defined in terms of submodule calls, tensor functions, and tensor methods — which covers most convolutional and transformer architectures — trace without modification.
 

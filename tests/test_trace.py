@@ -6,6 +6,7 @@ from torch import nn
 
 import torchdiagram as td
 from tests.models import (
+    ChainedSubscript,
     ComposedEncoder,
     CroppedHead,
     DualEncoder,
@@ -22,6 +23,7 @@ from tests.models import (
     ShapeMath,
     SiameseTower,
     StateOnlyTagger,
+    SteppedSubscripts,
     SubscriptedLayer,
     TinyCNN,
     TokenPrefix,
@@ -198,6 +200,8 @@ def test_single_return_keeps_one_plain_output_node():
         (TokenPrefix(), torch.randn(1, 3, 4)),
         (SiameseTower(), torch.randn(1, 4)),
         (CroppedHead(), torch.randn(1, 3, 5)),
+        (ChainedSubscript(), torch.randn(3, 4, 4)),
+        (SteppedSubscripts(), torch.randn(3, 4, 4)),
     ],
 )
 def test_both_frontends_emit_the_same_ir(model, example):
@@ -384,3 +388,35 @@ def test_trace_records_scope_for_nested_submodules():
     root = next(node for node in graph.nodes if node.id == "stem")
     assert root.scope is None
     assert root.scope_class is None
+
+
+def test_chained_subscripts_on_one_line_draw_one_box_in_both_frontends():
+    """`x[0][1]` is one indexing step to a reader; fx splits it in two and export cannot, so both collapse it."""
+    example = torch.randn(3, 4, 4)
+    for backend in ("fx", "export"):
+        ops = [node.op for node in td.trace(ChainedSubscript(), example, backend=backend).nodes]
+        assert ops.count("index") == 1, backend
+
+
+def test_subscripts_a_line_apart_keep_a_box_each_in_both_frontends():
+    """The collapse follows the source line, so two subscripts the model wrote as two steps stay two boxes."""
+    example = torch.randn(3, 4, 4)
+    for backend in ("fx", "export"):
+        ops = [node.op for node in td.trace(SteppedSubscripts(), example, backend=backend).nodes]
+        assert ops.count("index") == 2, backend
+
+
+def test_a_subscript_feeding_two_readers_is_not_collapsed():
+    """A result used more than once is a step of its own: collapsing it would drop an edge the model really has."""
+
+    class Fanout(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(4, 2)
+
+        def forward(self, x):
+            group = x[0]
+            return self.proj(group[1]) + self.proj(group[2])
+
+    graph = td.trace(Fanout(), torch.randn(3, 4, 4), backend="fx")
+    assert [node.op for node in graph.nodes].count("index") == 3

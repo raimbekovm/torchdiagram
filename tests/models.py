@@ -551,3 +551,31 @@ class NeedsConstructorArgs(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the linear classifier."""
         return self.fc(x)
+
+
+class ChainedSubscript(nn.Module):
+    """Subscripts twice in one expression — what fx splits in two and export cannot split at all."""
+
+    def __init__(self) -> None:
+        """Initialize the projection."""
+        super().__init__()
+        self.proj = nn.Linear(4, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Take one slot out of the first group, then project it."""
+        return self.proj(x[0][1])
+
+
+class SteppedSubscripts(nn.Module):
+    """The same two subscripts a line apart, which a reader wrote as two steps and both frontends keep as two."""
+
+    def __init__(self) -> None:
+        """Initialize the projection."""
+        super().__init__()
+        self.proj = nn.Linear(4, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Take the first group, then one slot out of it, then project."""
+        group = x[0]
+        slot = group[1]
+        return self.proj(slot)
