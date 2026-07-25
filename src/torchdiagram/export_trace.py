@@ -22,7 +22,7 @@ import torch
 import torch.fx
 from torch import nn
 
-from .frontend import build_edges, qualify_labels
+from .frontend import ExampleInput, append_outputs, as_args, build_edges, qualify_labels, result_keys
 from .graph import Graph, Node
 
 # fx's own leaf-module rule ("a torch.nn built-in that isn't a Sequential"), reused verbatim so that both frontends
@@ -36,13 +36,14 @@ _LEAF_PROBE = torch.fx.Tracer()
 _LOG_PREFIX = "torch"
 
 
-def trace_export(model: nn.Module, example_input: torch.Tensor, *, name: str | None = None) -> Graph:
+def trace_export(model: nn.Module, example_input: ExampleInput, *, name: str | None = None) -> Graph:
     """Trace ``model`` into a renderable graph using ``torch.export``.
 
     Args:
         model: Module to trace. Unlike the fx frontend, ``forward()`` may contain data-dependent control flow.
-        example_input: Input to trace with. Required — ``torch.export`` needs concrete arguments — and used for
-            output-shape annotation, which comes free with the export graph.
+        example_input: Input to trace with, as one tensor or a tuple with one per ``forward()`` argument. Required —
+            ``torch.export`` needs concrete arguments — and used for output-shape annotation, which comes free with the
+            export graph.
         name: Diagram title; defaults to the model's class name.
 
     Returns:
@@ -56,7 +57,7 @@ def trace_export(model: nn.Module, example_input: torch.Tensor, *, name: str | N
         UserWarning: If the graph had to be specialized on ``example_input``, meaning branches that input does not take
             are missing from the diagram.
     """
-    graph_module, specialized = _export(model, example_input)
+    graph_module, specialized = _export(model, as_args(example_input))
     if specialized:
         warnings.warn(
             f"{type(model).__name__} was traced with torch.export and specialized on the example input: branches "
@@ -67,28 +68,28 @@ def trace_export(model: nn.Module, example_input: torch.Tensor, *, name: str | N
     return _build_graph(model, graph_module, name=name or type(model).__name__)
 
 
-def _export(model: nn.Module, example_input: torch.Tensor) -> tuple[torch.fx.GraphModule, bool]:
+def _export(model: nn.Module, args: tuple[torch.Tensor, ...]) -> tuple[torch.fx.GraphModule, bool]:
     """Export ``model``, preferring a sound graph and falling back to a specialized one.
 
     Args:
         model: Module to export.
-        example_input: Input to export with.
+        args: One example tensor per ``forward()`` argument.
 
     Returns:
-        The exported graph module, and whether it was specialized on ``example_input`` rather than soundly exported.
+        The exported graph module, and whether it was specialized on ``args`` rather than soundly exported.
 
     Raises:
         Exception: The error from the sound attempt, if the specializing fallback is unavailable or also fails.
     """
     with _quiet_export():
         try:
-            return torch.export.export(model, (example_input,), strict=False).module(), False
+            return torch.export.export(model, args, strict=False).module(), False
         except Exception as sound_error:
             draft_export = getattr(torch.export, "draft_export", None)
             if draft_export is None:  # torch too old to have the real-tensor path
                 raise
             try:
-                program = draft_export(model, (example_input,))
+                program = draft_export(model, args)
             except Exception:
                 raise sound_error from None
     # `_report` is private, so treat its absence as "assume the worst" rather than silently claiming soundness.
@@ -142,11 +143,14 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
     used_ids: set[str] = set()
     paths: dict[str, str] = {}  # IR node id mapped to the submodule it came from, for label disambiguation
     plumbing = _plumbing(graph_module)
+    results: list[tuple[str | None, torch.fx.Node]] = []
 
     for fx_node in graph_module.graph.nodes:
-        if fx_node.op in ("placeholder", "output"):
-            op = "input" if fx_node.op == "placeholder" else "output"
-            node = Node(id=_unique(fx_node.name, used_ids), op=op, label=op, output_shape=_io_shape(fx_node))
+        if fx_node.op == "output":
+            results = _results(graph_module, fx_node)
+            continue
+        if fx_node.op == "placeholder":
+            node = Node(id=_unique(fx_node.name, used_ids), op="input", label="input", output_shape=_shape(fx_node))
         elif fx_node.op != "call_function" or fx_node in plumbing:
             continue  # get_attr parameter plumbing, the synthetic _guards_fn module, and symbolic guard assertions
         else:
@@ -190,7 +194,57 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
 
     qualify_labels(graph.nodes, paths)
     graph.edges = build_edges(owner)
+    append_outputs(graph, owner, results, _shape)
     return graph
+
+
+def _results(graph_module: torch.fx.GraphModule, fx_node: torch.fx.Node) -> list[tuple[str | None, torch.fx.Node]]:
+    """Read what an exported graph returns as ``(key, producing node)`` pairs.
+
+    Export flattens the return value, so the graph's ``output`` node always holds a flat tuple and says nothing about
+    whether the model returned one tensor, three, or a dict. That shape lives in the module's output pytree spec, which
+    is what tells a plain ``return y`` apart from a ``return (y,)`` — and so keeps the two frontends drawing the same
+    boxes for the same model.
+
+    Args:
+        graph_module: Result of ``ExportedProgram.module()``, carrying the output pytree spec.
+        fx_node: The graph's ``output`` node.
+
+    Returns:
+        One pair per returned tensor, in return order.
+    """
+    values = [
+        value for value in _flatten(fx_node.args[0] if fx_node.args else None) if isinstance(value, torch.fx.Node)
+    ]
+    spec = getattr(graph_module, "_out_spec", None)
+    structure, names = _out_structure(spec)
+    keys = result_keys(len(values), structure, names)
+    return list(zip(keys, values, strict=True))
+
+
+def _flatten(result: object) -> list[object]:
+    """The entries of an export ``output`` node's single argument, which is always a flat tuple."""
+    return list(result) if isinstance(result, (tuple, list)) else [result]
+
+
+def _out_structure(spec: object) -> tuple[str | None, list[str] | None]:
+    """Classify an output pytree spec as a dict return, a tuple return, or a single unwrapped tensor.
+
+    Args:
+        spec: The module's ``_out_spec``, or ``None`` when torch didn't record one.
+
+    Returns:
+        ``("dict", keys)``, ``("tuple", None)``, or ``(None, None)`` for a bare tensor.
+    """
+    kind = getattr(spec, "type", None)
+    if kind is None:  # a leaf spec, i.e. the model returns the tensor itself
+        return None, None
+    if kind is dict:
+        context = getattr(spec, "context", None)
+        return "dict", [str(key) for key in context] if isinstance(context, list) else None
+    if kind in (tuple, list):
+        return "tuple", None
+    return None, None
 
 
 def _leaf_module(model: nn.Module, entries: list[tuple[str, object]]) -> tuple[str, nn.Module | None]:
@@ -272,25 +326,6 @@ def _plumbing(graph_module: torch.fx.GraphModule) -> set[torch.fx.Node]:
         if is_guard or serves_only_guards:
             plumbing.add(fx_node)
     return plumbing
-
-
-def _io_shape(fx_node: torch.fx.Node) -> tuple[int, ...] | None:
-    """Read the shape of a graph input or output node.
-
-    Export leaves the ``output`` node without ``val`` metadata of its own, so a single-return model's output shape is
-    read off the node feeding it — matching what fx's shape propagation records there.
-
-    Args:
-        fx_node: The ``placeholder`` or ``output`` node.
-
-    Returns:
-        The shape, or ``None`` when the model takes or returns something other than one tensor.
-    """
-    shape = _shape(fx_node)
-    if shape is not None or fx_node.op != "output":
-        return shape
-    inputs = fx_node.all_input_nodes
-    return _shape(inputs[0]) if len(inputs) == 1 else None
 
 
 def _is_tensor_valued(val: object) -> bool:

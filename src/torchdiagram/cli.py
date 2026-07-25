@@ -42,7 +42,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("-o", "--output", required=True, help="Output file (.svg, .png, .tex, .tikz).")
     parser.add_argument(
         "--input-shape",
-        help="Comma-separated input shape, e.g. '1,3,224,224'; enables shape annotations on every node.",
+        action="append",
+        help="Comma-separated input shape, e.g. '1,3,224,224'; enables shape annotations on every node. Repeat it "
+        "once per forward() argument for a model taking more than one input.",
     )
     parser.add_argument(
         "--aggregate",
@@ -98,25 +100,29 @@ def main(argv: list[str] | None = None) -> None:
     print(f"wrote {path}")
 
 
-def _build_example_input(input_shape: str | None) -> torch.Tensor | None:
-    """Parse ``--input-shape`` into an example tensor for shape propagation.
+def _build_example_input(input_shapes: list[str] | None) -> tuple[torch.Tensor, ...] | None:
+    """Parse the ``--input-shape`` values into example tensors for shape propagation.
 
     Args:
-        input_shape: Comma-separated dimensions, e.g. ``"1,3,224,224"``, or ``None`` to skip shape annotation.
+        input_shapes: One comma-separated dimension list per ``forward()`` argument, e.g. ``["1,3,224,224"]``, or
+            ``None`` to skip shape annotation.
 
     Returns:
-        A randomly initialized tensor of the requested shape, or ``None`` if ``input_shape`` is ``None``.
+        A randomly initialized tensor per requested shape, in argument order, or ``None`` if no shape was given.
 
     Raises:
-        SystemExit: If ``input_shape`` is not a comma-separated list of integers, or any dimension is invalid.
+        SystemExit: If a shape is not a comma-separated list of integers, or any dimension is invalid.
     """
-    if not input_shape:
+    if not input_shapes:
         return None
-    try:
-        shape = tuple(int(dim.strip()) for dim in input_shape.split(","))
-        return torch.randn(*shape)
-    except (ValueError, RuntimeError) as exc:
-        raise SystemExit(f"error: invalid --input-shape {input_shape!r}: {exc}") from exc
+    tensors = []
+    for input_shape in input_shapes:
+        try:
+            shape = tuple(int(dim.strip()) for dim in input_shape.split(","))
+            tensors.append(torch.randn(*shape))
+        except (ValueError, RuntimeError) as exc:
+            raise SystemExit(f"error: invalid --input-shape {input_shape!r}: {exc}") from exc
+    return tuple(tensors)
 
 
 def _load_model(spec: str) -> nn.Module:

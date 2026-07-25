@@ -14,7 +14,7 @@ torchdiagram MODEL -o OUTPUT [--input-shape SHAPE] [--aggregate] [--min-repeats 
 | ---------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `MODEL`          | yes      | Import path to the model in the form `package.module:attr`.                                                                                                      |
 | `-o`, `--output` | yes      | Output file. The format is selected by extension: `.svg`, `.tex`, `.tikz`, or `.png`.                                                                            |
-| `--input-shape`  | no       | Comma-separated input shape, e.g. `1,3,224,224`. Enables output-shape annotations on every node.                                                                 |
+| `--input-shape`  | no       | Comma-separated input shape, e.g. `1,3,224,224`. Enables output-shape annotations on every node. Repeatable, once per `forward()` argument.                      |
 | `--aggregate`    | no       | Collapse scoped blocks — repeated (e.g. ResNet layers) and singleton (e.g. a transformer's attention/MLP sub-block) — into single labeled nodes. Off by default. |
 | `--min-repeats`  | no       | Minimum run length required to merge multiple blocks into one badged node with `--aggregate` (default: `2`); shorter runs still collapse individually.           |
 | `--theme`        | no       | Color theme: `default` (soft blue), `mono` (grayscale, for print), or `dark` (for dark backgrounds). Default: `default`.                                         |
@@ -35,7 +35,13 @@ Models that require constructor arguments cannot be instantiated by the CLI; wra
 
 ## Input shape
 
-When `--input-shape` is given, the CLI creates a random float tensor of that shape with `torch.randn` and uses it for shape propagation. For models that expect non-float inputs (for example, token indices for an embedding layer), use the Python API and pass an appropriate `example_input` to `trace()`.
+When `--input-shape` is given, the CLI creates a random float tensor of that shape with `torch.randn` and uses it for shape propagation. Repeat the flag for a model whose `forward()` takes more than one tensor, once per argument and in argument order:
+
+```bash
+torchdiagram my_models:DualEncoder -o dual.svg --input-shape 1,4 --input-shape 1,8
+```
+
+For models that expect non-float inputs (for example, token indices for an embedding layer), use the Python API and pass an appropriate `example_input` to `trace()`.
 
 ## Examples
 

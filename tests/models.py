@@ -266,6 +266,37 @@ class UnusedBranch(nn.Module):
         return self.used(x)
 
 
+class DualEncoder(nn.Module):
+    """Two towers scored against each other — a model whose ``forward()`` takes more than one tensor."""
+
+    def __init__(self) -> None:
+        """Initialize the two encoders."""
+        super().__init__()
+        self.left = nn.Linear(4, 6)
+        self.right = nn.Linear(8, 6)
+
+    def forward(self, left_input: torch.Tensor, right_input: torch.Tensor) -> torch.Tensor:
+        """Encode both inputs and score them by a dot product."""
+        return (self.left(left_input) * self.right(right_input)).sum(dim=-1)
+
+
+class PyramidHeads(nn.Module):
+    """A detection-style head returning one prediction per level — several tensors, not one."""
+
+    def __init__(self) -> None:
+        """Initialize the stem, the downsample, and the two prediction heads."""
+        super().__init__()
+        self.stem = nn.Conv2d(3, 4, kernel_size=3, padding=1)
+        self.down = nn.Conv2d(4, 8, kernel_size=3, stride=2, padding=1)
+        self.head1 = nn.Conv2d(4, 2, kernel_size=1)
+        self.head2 = nn.Conv2d(8, 2, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Predict from both pyramid levels and return both."""
+        fine = self.stem(x)
+        return self.head1(fine), self.head2(self.down(fine))
+
+
 class NeedsConstructorArgs(nn.Module):
     """Requires a constructor argument — exercises the CLI's zero-argument-factory error path."""
 
