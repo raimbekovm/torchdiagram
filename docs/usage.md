@@ -12,13 +12,13 @@ graph = td.trace(model)
 
 The trace records the actual data flow of `forward()`, so the diagram is derived from the code rather than from a separate, manually maintained description. The following constructs are captured:
 
-- **Submodule calls** (`self.conv(x)`) become nodes labeled with the layer class name (`Conv2d`, `Linear`, ...). The layer configuration reported by `extra_repr()` — kernel size, feature counts, and so on — is stored in `node.params["config"]`.
+- **Submodule calls** (`self.conv(x)`) become nodes labeled with the layer class name (`Conv2d`, `Linear`, ...). The layer configuration reported by `extra_repr()` — kernel size, feature counts, and so on — is stored in `node.params["config"]`. Where two layers of the same class sit at the same level of the model, the class name alone would label both boxes identically, so each is qualified with the attribute it was traced from: a transformer's token and position embeddings draw as `Embedding (tok_emb)` and `Embedding (pos_emb)`. A layer that is alone under its label keeps the plain class name.
 - **Function calls** (`torch.relu(x)`, `x + y`, `torch.flatten(x, 1)`) become nodes named after the function (`relu`, `add`, `flatten`).
 - **Method calls** (`x.view(...)`, `x.mean(...)`) become nodes named after the method.
 - **Model inputs and outputs** become dedicated `input` and `output` nodes.
 - **Residual connections and parallel branches** appear as additional edges; a node may have any number of incoming and outgoing edges.
 
-Parameter and buffer accesses (`get_attr` in fx terms) are internal plumbing and are excluded from the diagram.
+Two kinds of node are internal plumbing and are excluded from the diagram: parameter and buffer accesses (`get_attr` in fx terms), and code that computes with a tensor's metadata rather than with the tensor. The second kind covers `x.shape[1]`, `x.size(0)`, and the arithmetic built on them — an attention head's `c // self.heads` is three nodes of it — none of which is an architecture step. What consumes them stays: `torch.arange(x.shape[1])` produces a real tensor, so the range is drawn, connected to the input the shape was read from.
 
 ### Shape annotations
 
@@ -93,11 +93,25 @@ This outer merge relies on the block having at least one op of its own at that s
 common case); a container that does nothing but call its children collapses its contents fine but won't merge
 across repeats itself — see [design.md](design.md#block-aggregation).
 
-Only exact structural matches merge. A stage whose first block differs from the rest — for example a ResNet
-stage's first `Bottleneck`, which has an extra downsample convolution on the shortcut — collapses to its own
-single node rather than merging with its neighbors; the remaining uniform blocks merge into one. This is
-expected, not a bug: it keeps the diagram from misrepresenting a block that isn't actually identical to its
-neighbors, while still compacting it to one glyph.
+Only exact matches merge, and the badge is a claim the transform has to be able to back. Two neighboring groups
+merge into one `×N` node only when three things agree: their op sequence and internal wiring, the configuration
+of every layer in them, and, for any block already collapsed inside them, everything that block collapsed. The
+last two matter more than they sound. A VGG stage running 64 channels and the next one running 128 have the same
+op sequence, so comparing structure alone would badge them `VGGBlock ×2` although they are different sizes; and
+once each stage's inner `nn.Sequential` has collapsed to one node, a two-convolution stage and a
+three-convolution one read as the same two-node sequence, so comparing only what is visible after collapsing
+would merge those too. Both cases stay separate.
+
+A stage whose first block differs from the rest — for example a ResNet stage's first `Bottleneck`, which has an
+extra downsample convolution on the shortcut — likewise collapses to its own single node rather than merging
+with its neighbors; the remaining uniform blocks merge into one. This is expected, not a bug: it keeps the
+diagram from misrepresenting a block that isn't actually identical to its neighbors, while still compacting it
+to one glyph.
+
+Collapsed blocks are labeled with the class of the module they came from. `nn.Sequential`, `nn.ModuleList`, and
+`nn.ModuleDict` are the exception: their class name describes a container rather than a computation, so a block
+collapsed from one is labeled with the attribute holding it — a `self.classifier = nn.Sequential(...)` head draws
+as `classifier`, not as `Sequential`.
 
 `min_repeats` (default `2`) sets how many consecutive matching blocks are required before they merge into one
 badged node; below that, each still collapses individually, just without the `×N` badge:

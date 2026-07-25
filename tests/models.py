@@ -94,6 +94,77 @@ class NonUniformBlockStack(nn.Module):
         return self.layer1(self.stem(x))
 
 
+class ConvStage(nn.Module):
+    """A convolution stack behind a pooling layer — a VGG stage, the shape that hid its contents from aggregation."""
+
+    def __init__(self, in_channels: int, out_channels: int, num_convs: int) -> None:
+        """Initialize ``num_convs`` convolutions inside a Sequential, followed by a pool."""
+        super().__init__()
+        channels = [in_channels] + [out_channels] * num_convs
+        self.body = nn.Sequential(*[nn.Conv2d(channels[i], channels[i + 1], 3, padding=1) for i in range(num_convs)])
+        self.pool = nn.MaxPool2d(2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the convolution stack, then pool."""
+        return self.pool(self.body(x))
+
+
+class WideningStack(nn.Module):
+    """Two stages with the same op sequence but different channel counts — repeats in shape only, not in fact."""
+
+    def __init__(self) -> None:
+        """Initialize two stages of equal depth and unequal width."""
+        super().__init__()
+        self.stage1 = ConvStage(3, 4, 1)
+        self.stage2 = ConvStage(4, 8, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply both stages in sequence."""
+        return self.stage2(self.stage1(x))
+
+
+class MixedDepthStack(nn.Module):
+    """Two identically sized stages holding a different number of convolutions, which only their contents reveal."""
+
+    def __init__(self) -> None:
+        """Initialize a two-convolution stage followed by a three-convolution one."""
+        super().__init__()
+        self.stage1 = ConvStage(4, 4, 2)
+        self.stage2 = ConvStage(4, 4, 3)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply both stages in sequence."""
+        return self.stage2(self.stage1(x))
+
+
+class ClassifierHead(nn.Module):
+    """A model whose head is a bare ``nn.Sequential``, whose class name says nothing about what it does."""
+
+    def __init__(self) -> None:
+        """Initialize the stem convolution and the Sequential classifier."""
+        super().__init__()
+        self.stem = nn.Conv2d(3, 4, kernel_size=3, padding=1)
+        self.classifier = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Pool the stem features to a vector, then classify."""
+        return self.classifier(torch.flatten(F.adaptive_avg_pool2d(self.stem(x), 1), 1))
+
+
+class ShapeMath(nn.Module):
+    """Builds a position range from its input's shape — metadata plumbing the diagram must route around, not draw."""
+
+    def __init__(self) -> None:
+        """Initialize the position embedding and the output projection."""
+        super().__init__()
+        self.pos = nn.Embedding(16, 4)
+        self.proj = nn.Linear(4, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Add a position embedding sized from the input's own length, then project."""
+        return self.proj(x + self.pos(torch.arange(x.shape[1])))
+
+
 class Attention(nn.Module):
     """Multi-head self-attention written out by hand — qkv projection, softmax, no fused kernel or leaf module."""
 

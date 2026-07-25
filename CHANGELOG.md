@@ -6,7 +6,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Added
 
-- `torchdiagram.trace()`: trace any fx-traceable `nn.Module` (residuals, branches, functional ops) into a framework-agnostic graph IR, with optional output-shape annotation from an example input.
+- `torchdiagram.trace()`: trace any fx-traceable `nn.Module` (residuals, branches, functional ops) into a framework-agnostic graph IR, with optional output-shape annotation from an example input. Parameter plumbing and metadata computations (`x.shape[1]`, `x.size(0)`, and the arithmetic over them) are left out of the diagram, with the data flow reconnected across them; layers of the same class at the same level are labeled apart by attribute, e.g. `Embedding (tok_emb)`.
+- `torchdiagram.aggregate_blocks()`: collapse scoped blocks into single labeled nodes, recursively from the deepest nesting outward, badging runs of matching blocks as `BasicBlock ×5`. Blocks merge only when their layer configuration and their already-collapsed contents match, so stages differing in width or depth stay separate; blocks collapsed from an `nn.Sequential` and friends are named after the attribute holding them.
 - `torch.export` fallback frontend for models `torch.fx` cannot trace, such as those with data-dependent control flow. Selected automatically when symbolic tracing fails, or pinned with `trace(..., backend="export")` and `--backend`. The fallback specializes on the example input and warns that untaken branches are absent from the diagram; both frontends emit the same IR.
 - SVG renderer with curved routing for skip/residual edges.
 - TikZ renderer producing a standalone compilable LaTeX document.

@@ -4,7 +4,7 @@ import pytest
 import torch
 
 import torchdiagram as td
-from tests.models import GatedNet, RepeatedBlockStack, ResidualBlock, TinyCNN, UnusedBranch
+from tests.models import GatedNet, RepeatedBlockStack, ResidualBlock, ShapeMath, TinyCNN, UnusedBranch
 
 
 def test_trace_produces_valid_graph_with_io_nodes():
@@ -86,6 +86,31 @@ def test_fallback_keeps_the_branch_the_example_input_takes():
         "linear",
         "output",
     ]
+
+
+def test_shape_plumbing_is_not_drawn():
+    """Reading a tensor's shape is not an architecture step, so none of it reaches the diagram."""
+    graph = td.trace(ShapeMath(), torch.randn(1, 8, 4))
+    ops = [node.op for node in graph.nodes]
+    assert ops == ["input", "arange", "embedding", "add", "linear", "output"]
+
+
+def test_shape_plumbing_keeps_the_flow_connected():
+    """Dropping the shape lookup must not orphan what consumed it: the range still depends on the input."""
+    graph = td.trace(ShapeMath(), torch.randn(1, 8, 4))
+    graph.validate()
+    source = next(node for node in graph.nodes if node.op == "input")
+    arange = next(node for node in graph.nodes if node.op == "arange")
+    assert td.Edge(source.id, arange.id) in graph.edges
+
+
+def test_duplicate_layer_labels_are_qualified_by_attribute():
+    """Two layers of one class in one scope are named apart; a layer alone under its label keeps the bare class name."""
+    labels = [node.label for node in td.trace(ResidualBlock()).nodes]
+    assert "Conv2d (conv1)" in labels
+    assert "Conv2d (conv2)" in labels
+    # TinyCNN holds one convolution and one linear layer, so neither has anything to be told apart from.
+    assert "Conv2d" in [node.label for node in td.trace(TinyCNN()).nodes]
 
 
 def test_backend_fx_does_not_fall_back():

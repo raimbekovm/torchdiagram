@@ -22,7 +22,8 @@ import torch
 import torch.fx
 from torch import nn
 
-from .graph import Edge, Graph, Node
+from .frontend import build_edges, qualify_labels
+from .graph import Graph, Node
 
 # fx's own leaf-module rule ("a torch.nn built-in that isn't a Sequential"), reused verbatim so that both frontends
 # draw the same box for the same layer instead of each inventing its own notion of a leaf.
@@ -139,6 +140,7 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
     owner: dict[torch.fx.Node, str] = {}  # every kept fx node, mapped to the IR node that represents it
     by_module: dict[str, Node] = {}
     used_ids: set[str] = set()
+    paths: dict[str, str] = {}  # IR node id mapped to the submodule it came from, for label disambiguation
     plumbing = _plumbing(graph_module)
 
     for fx_node in graph_module.graph.nodes:
@@ -182,19 +184,12 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
                     scope_class=scope_class,
                 )
                 by_module[path] = node
+                paths[node.id] = path
         owner[fx_node] = node.id
         graph.nodes.append(node)
 
-    seen_edges: set[tuple[str, str]] = set()
-    for fx_node, target_id in owner.items():
-        for upstream in fx_node.all_input_nodes:
-            source_id = owner.get(upstream)
-            # Merging a layer's ATen ops turns its internal edges into self-edges; drop those along with edges from
-            # nodes that never made it into the IR.
-            if source_id is None or source_id == target_id or (source_id, target_id) in seen_edges:
-                continue
-            seen_edges.add((source_id, target_id))
-            graph.edges.append(Edge(source=source_id, target=target_id))
+    qualify_labels(graph.nodes, paths)
+    graph.edges = build_edges(owner)
     return graph
 
 
