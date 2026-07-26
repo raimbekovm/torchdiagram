@@ -595,6 +595,34 @@ class FixedRange(nn.Module):
         return self.proj(x + self.pos(torch.arange(8)))
 
 
+class CastRange(nn.Module):
+    """Builds a range and casts its dtype — a tensor made from nothing, and an operation done to it."""
+
+    def __init__(self) -> None:
+        """Initialize the output projection."""
+        super().__init__()
+        self.proj = nn.Linear(4, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Add a cast range, then project."""
+        return self.proj(x + torch.arange(4).float())
+
+
+class LoopedRange(nn.Module):
+    """Iterates a range instead of computing with it, which no symbolic stand-in for that range can support."""
+
+    def __init__(self) -> None:
+        """Initialize the output projection."""
+        super().__init__()
+        self.proj = nn.Linear(4, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Shift the input by each element of a range in turn, then project."""
+        for shift in torch.arange(2):
+            x = x + shift
+        return self.proj(x)
+
+
 class Slice(nn.Module):
     """Drops the first item of whatever it is given — one subscript, in a submodule that gets applied twice."""
 
