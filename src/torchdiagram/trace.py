@@ -64,10 +64,23 @@ _SELF_ROOT = os.path.normcase(os.path.join(os.path.dirname(__file__), ""))
 # Tensor factories to keep as operations while tracing. A call with no tensor in it — `torch.arange(8)`, `torch.eye(4)`
 # — hands fx no proxy to trace through, so fx runs it then and there and stores the result as a graph attribute. The
 # diagram then reads `_tensor_constant0`, a name torch invented, where export reads `arange`, and anything the model
-# computes from that tensor is folded away with it and never drawn at all. `torch.tensor` is deliberately not here:
-# export lifts it into a constant of its own rather than keeping the call, so tracing it would trade one disagreement
-# between the frontends for another.
-_FACTORIES = ("arange", "empty", "eye", "full", "linspace", "ones", "rand", "randint", "randn", "zeros")
+# computes from that tensor is folded away with it and never drawn at all: `torch.tensor([1, 2]).float()` is one grey
+# box on a diagram, with the cast nowhere on it. `torch.Tensor([1., 2.])` is the one spelling left out, since it is a
+# class rather than a function and standing something else in its place breaks every `isinstance` check torch runs.
+_FACTORIES = (
+    "arange",
+    "as_tensor",
+    "empty",
+    "eye",
+    "full",
+    "linspace",
+    "ones",
+    "rand",
+    "randint",
+    "randn",
+    "tensor",
+    "zeros",
+)
 
 
 def trace(

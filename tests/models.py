@@ -623,6 +623,46 @@ class LoopedRange(nn.Module):
         return self.proj(x)
 
 
+class ScaledLiteral(nn.Module):
+    """Writes two literal tensors and computes with them — a tensor export lifts out of ``forward()`` entirely."""
+
+    def __init__(self) -> None:
+        """Initialize the output projection."""
+        super().__init__()
+        self.proj = nn.Linear(4, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Shift the input by one literal scaled by another, then project."""
+        return self.proj(x + torch.tensor([1.0, 2.0, 3.0, 4.0]) * torch.tensor(0.5))
+
+
+class DetachedLiteral(nn.Module):
+    """Detaches a literal, so the detach export leaves on every literal has one the reader wrote to sit beside."""
+
+    def __init__(self) -> None:
+        """Initialize the output projection."""
+        super().__init__()
+        self.proj = nn.Linear(4, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Add a detached literal, then project."""
+        return self.proj(x + torch.tensor([1.0, 2.0, 3.0, 4.0]).detach())
+
+
+class BufferedShift(nn.Module):
+    """Shifts by a registered buffer, the tensor a lifted literal must not be confused with."""
+
+    def __init__(self) -> None:
+        """Initialize the buffer and the output projection."""
+        super().__init__()
+        self.register_buffer("shift", torch.ones(4))
+        self.proj = nn.Linear(4, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Add the buffer, then project."""
+        return self.proj(x + self.shift)
+
+
 class Slice(nn.Module):
     """Drops the first item of whatever it is given — one subscript, in a submodule that gets applied twice."""
 

@@ -89,7 +89,8 @@ graph = td.trace(detector, torch.randn(1, 3, 256, 256))
 - A model the `torch.export` frontend also cannot handle surfaces the original `TraceError` from fx, since that error describes the model rather than the fallback.
 - A run of subscripts written on one line (`x[0][1]`, `x[:, 0, :-1]`) draws as a single `index` box. Written as separate statements they draw as one box each, on both frontends — the source line is what tells the two apart.
 - A tensor built inside `forward()` from a Python value the model then consumes as a Python value — iterating `torch.arange(2)`, or reading an element out of it to branch on — is run during tracing rather than drawn, and whatever the model computes from it is folded into a constant. Everything up to that point is drawn as usual.
-- A tensor written as a literal (`torch.tensor([1.0, 2.0])`) draws as one constant box under fx and as a lifted constant plus its copy and detach under export.
+- A literal written as `torch.Tensor([1.0, 2.0])` — the capital-`T` constructor — draws as one constant box under fx and as a `tensor` box under export. `torch.tensor` and `torch.as_tensor` both draw a `tensor` box on either frontend; `torch.Tensor` is a class rather than a function, and standing something else in its place while tracing would break every `isinstance` check torch runs.
+- `torch.tensor` and `torch.as_tensor` draw the same `tensor` box, since export lifts a literal out of `forward()` and keeps no record of which of the two wrote it.
 - An operation sized by an _activation's_ shape rather than an input's (`torch.arange(h.shape[1])`) gets its arrow from the layer that produced the activation under fx, and from the input under export. Both are drawn; they attribute the same dependency to different ends of it.
 
 Models that are fully defined in terms of submodule calls, tensor functions, and tensor methods — which covers most convolutional and transformer architectures — trace without modification.

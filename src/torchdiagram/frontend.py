@@ -35,12 +35,20 @@ _CASTS = frozenset(
     {"bfloat16", "bool", "byte", "char", "double", "float", "half", "int", "long", "short", "type", "type_as"}
 )
 
+# Names a tensor built from literal data can arrive under. Export keeps no call at all: it lifts the literal out of
+# `forward()` into a constant of the exported program, and what stands in the graph is `lift_fresh_copy`, the op that
+# reads the constant back. That op is all export records, so it cannot tell `torch.tensor([1., 2.])` from
+# `torch.as_tensor([1., 2.])` and neither can the diagram; both draw the box the more common of the two spells.
+_LITERALS = frozenset({"as_tensor", "lift_fresh_copy"})
+
 
 def normalize_label(name: str) -> str:
     """Map a functional op's name to the one both frontends agree on, e.g. every form of subscript to ``index``."""
     if name in _INDEXING:
         return "index"
-    return "to" if name in _CASTS else name
+    if name in _CASTS:
+        return "to"
+    return "tensor" if name in _LITERALS else name
 
 
 def as_args(example_input: ExampleInput) -> tuple[torch.Tensor, ...]:
@@ -208,11 +216,28 @@ def parameter_node(model: torch.nn.Module, target: str, shape: tuple[int, ...] |
     Returns:
         The IR node, named after the attribute and marked ``parameter`` or ``buffer`` by what it actually is.
     """
+    op = "parameter" if isinstance(model_attribute(model, target), torch.nn.Parameter) else "buffer"
+    return Node(id=target.replace(".", "_"), op=op, label=target.rpartition(".")[2], output_shape=shape)
+
+
+def model_attribute(model: torch.nn.Module, target: str) -> object | None:
+    """The value a dotted attribute path names on ``model``, or ``None`` where the model holds no such attribute.
+
+    Absence is the answer as often as the value is. A tracer is free to hang tensors of its own off the graph it
+    produces — export lifts a literal written in ``forward()`` into a ``lifted_tensor_0`` attribute — and those look
+    exactly like a model's own buffer from the graph alone. Asking the original module separates the two.
+
+    Args:
+        model: The module the attribute is looked up on.
+        target: Dotted attribute path, e.g. ``"cls_token"`` or ``"blocks.0.mask"``.
+
+    Returns:
+        The attribute, or ``None``.
+    """
     attribute: object = model
     for part in target.split("."):
         attribute = getattr(attribute, part, None)
-    op = "parameter" if isinstance(attribute, torch.nn.Parameter) else "buffer"
-    return Node(id=target.replace(".", "_"), op=op, label=target.rpartition(".")[2], output_shape=shape)
+    return attribute
 
 
 def class_name(cls: object) -> str:

@@ -6,10 +6,12 @@ from torch import nn
 
 import torchdiagram as td
 from tests.models import (
+    BufferedShift,
     CastRange,
     ChainedSubscript,
     ComposedEncoder,
     CroppedHead,
+    DetachedLiteral,
     DualEncoder,
     FixedRange,
     GatedNet,
@@ -22,6 +24,7 @@ from tests.models import (
     RepeatedBlockStack,
     RepeatedCall,
     ResidualBlock,
+    ScaledLiteral,
     SequenceTagger,
     ShapeMath,
     SiameseTower,
@@ -210,6 +213,9 @@ def test_single_return_keeps_one_plain_output_node():
         (SlicedTwice(), torch.randn(6, 4, 4)),
         (FixedRange(), torch.randn(1, 8, 4)),
         (CastRange(), torch.randn(1, 4)),
+        (ScaledLiteral(), torch.randn(1, 4)),
+        (DetachedLiteral(), torch.randn(1, 4)),
+        (BufferedShift(), torch.randn(1, 4)),
     ],
 )
 def test_both_frontends_emit_the_same_ir(model, example):
@@ -469,6 +475,41 @@ def test_a_dtype_cast_draws_the_same_box_in_both_frontends():
     for backend in ("fx", "export"):
         graph = td.trace(CastRange(), torch.randn(1, 4), backend=backend)
         assert [node.label for node in graph.nodes if node.op == "to"] == ["to"]
+
+
+def test_a_literal_tensor_is_one_box_in_both_frontends():
+    """A literal is a tensor the model writes, and the two tracers dispose of it in two different ways.
+
+    fx runs the call and keeps a graph attribute, folding the multiplication away with it. Export lifts the literal into
+    a constant of the exported program and leaves the ops that copy it back out standing in the graph.
+    """
+    for backend in ("fx", "export"):
+        graph = td.trace(ScaledLiteral(), torch.randn(1, 4), backend=backend)
+        assert [node.label for node in graph.nodes if node.op not in ("input", "output")] == [
+            "tensor",
+            "tensor",
+            "mul",
+            "add",
+            "Linear",
+        ], backend
+
+
+def test_a_detach_the_model_wrote_keeps_its_box_beside_the_one_export_adds():
+    """Export spells a literal ``lift_fresh_copy`` then ``detach_``; only the first is the tensor the reader wrote.
+
+    The fold has to be narrow enough to leave ``x.detach()`` alone, which lowers to the out-of-place overload and is an
+    operation fx draws.
+    """
+    for backend in ("fx", "export"):
+        graph = td.trace(DetachedLiteral(), torch.randn(1, 4), backend=backend)
+        assert [node.label for node in graph.nodes if node.op in ("tensor", "detach")] == ["tensor", "detach"], backend
+
+
+def test_a_registered_buffer_is_not_mistaken_for_a_lifted_literal():
+    """Both arrive as a ``get_attr`` in an exported graph; what tells them apart is whether the model has one."""
+    for backend in ("fx", "export"):
+        graph = td.trace(BufferedShift(), torch.randn(1, 4), backend=backend)
+        assert [(node.op, node.label) for node in graph.nodes if node.op == "buffer"] == [("buffer", "shift")], backend
 
 
 def test_a_range_the_model_iterates_still_traces():
