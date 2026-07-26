@@ -28,10 +28,19 @@ LEAF_PROBE = torch.fx.Tracer()
 # model draws a box reading `getitem` under one frontend and `slice` under the other.
 _INDEXING = frozenset({"getitem", "slice", "select", "index"})
 
+# Names a dtype cast can arrive under, for the same reason. `x.float()` is a method of its own to fx and one more
+# overload of `to` to export, which lowers every cast the same way, so a model that casts anything draws a box reading
+# `float` on one side and `to` on the other.
+_CASTS = frozenset(
+    {"bfloat16", "bool", "byte", "char", "double", "float", "half", "int", "long", "short", "type", "type_as"}
+)
+
 
 def normalize_label(name: str) -> str:
     """Map a functional op's name to the one both frontends agree on, e.g. every form of subscript to ``index``."""
-    return "index" if name in _INDEXING else name
+    if name in _INDEXING:
+        return "index"
+    return "to" if name in _CASTS else name
 
 
 def as_args(example_input: ExampleInput) -> tuple[torch.Tensor, ...]:

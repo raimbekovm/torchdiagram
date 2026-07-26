@@ -10,11 +10,13 @@ falls back to automatically; see docs/design.md.
 
 from __future__ import annotations
 
+import functools
 import io
 import operator
 import os
 import sys
-from contextlib import redirect_stderr
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, redirect_stderr
 from types import FrameType
 
 import torch
@@ -58,6 +60,14 @@ _SCALAR_MODULES = frozenset({"builtins", "operator", "_operator"})
 # whose name starts the same way — and a torchvision model would have every frame of its own code skipped.
 _TORCH_ROOT = os.path.normcase(os.path.join(os.path.dirname(torch.__file__), ""))
 _SELF_ROOT = os.path.normcase(os.path.join(os.path.dirname(__file__), ""))
+
+# Tensor factories to keep as operations while tracing. A call with no tensor in it — `torch.arange(8)`, `torch.eye(4)`
+# — hands fx no proxy to trace through, so fx runs it then and there and stores the result as a graph attribute. The
+# diagram then reads `_tensor_constant0`, a name torch invented, where export reads `arange`, and anything the model
+# computes from that tensor is folded away with it and never drawn at all. `torch.tensor` is deliberately not here:
+# export lifts it into a constant of its own rather than keeping the call, so tracing it would trade one disagreement
+# between the frontends for another.
+_FACTORIES = ("arange", "empty", "eye", "full", "linspace", "ones", "rand", "randint", "randn", "zeros")
 
 
 def trace(
@@ -233,6 +243,11 @@ def _source_site() -> str | None:
 def _symbolic_trace(model: nn.Module) -> torch.fx.GraphModule:
     """Symbolically trace ``model``, as ``torch.fx.symbolic_trace`` does but keeping each node's source line.
 
+    Tensor factories are traced rather than run (see :data:`_FACTORIES`). A model is free to use one as a Python value
+    instead — iterating it, or reading an element out to branch on — and a proxy cannot stand in for that, so a trace
+    that fails with the factories held back is retried without them. Anything that traced before still traces, and the
+    error a model that traces neither way reports is the one it always reported.
+
     Args:
         model: Module to trace.
 
@@ -243,8 +258,52 @@ def _symbolic_trace(model: nn.Module) -> torch.fx.GraphModule:
         torch.fx.proxy.TraceError: If ``model`` is not symbolically traceable.
     """
     tracer = _LineTracer()
-    graph = tracer.trace(model)
+    try:
+        with _factories_traced(tracer):
+            graph = tracer.trace(model)
+    except Exception:
+        tracer = _LineTracer()
+        graph = tracer.trace(model)
     return torch.fx.GraphModule(tracer.root, graph, type(model).__name__)
+
+
+@contextmanager
+def _factories_traced(tracer: torch.fx.Tracer) -> Iterator[None]:
+    """Make the tensor factories in :data:`_FACTORIES` record a node instead of running, for the duration of a trace."""
+    originals = {name: getattr(torch, name) for name in _FACTORIES}
+    for name, factory in originals.items():
+        setattr(torch, name, _traced_factory(tracer, factory))
+    try:
+        yield
+    finally:
+        for name, factory in originals.items():
+            setattr(torch, name, factory)
+
+
+def _traced_factory(tracer: torch.fx.Tracer, factory: Callable[..., object]) -> Callable[..., object]:
+    """Wrap a tensor factory so a call from model code becomes a graph node.
+
+    Only from model code. torch builds tensors constantly on its own way down to an operation — a functional op filling
+    in a default argument, a leaf layer's internals — and those are implementation, not architecture; handing one a
+    proxy where it expects a tensor would break a trace that has nothing to do with what the model wrote.
+    """
+
+    @functools.wraps(factory)
+    def traced(*args: object, **kwargs: object) -> object:
+        if not _in_model():
+            return factory(*args, **kwargs)
+        return tracer.create_proxy("call_function", factory, args, kwargs)
+
+    return traced
+
+
+def _in_model() -> bool:
+    """Whether the code that called the wrapped factory is the model's own, rather than torch's or this package's."""
+    try:
+        path = os.path.normcase(sys._getframe(2).f_code.co_filename)  # 0 is here, 1 is the wrapper, 2 is the caller
+    except ValueError:  # a stack too shallow to have a caller, which tracing never produces
+        return False
+    return not path.startswith(_TORCH_ROOT) and not path.startswith(_SELF_ROOT)
 
 
 class _ShapeProp(ShapeProp):

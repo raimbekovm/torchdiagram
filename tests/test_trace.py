@@ -6,12 +6,14 @@ from torch import nn
 
 import torchdiagram as td
 from tests.models import (
+    CastRange,
     ChainedSubscript,
     ComposedEncoder,
     CroppedHead,
     DualEncoder,
     FixedRange,
     GatedNet,
+    LoopedRange,
     NamedOutput,
     NestedReturn,
     NumberedReuse,
@@ -206,6 +208,8 @@ def test_single_return_keeps_one_plain_output_node():
         (SteppedSubscripts(), torch.randn(3, 4, 4)),
         (ShapeMath(), torch.randn(1, 8, 4)),
         (SlicedTwice(), torch.randn(6, 4, 4)),
+        (FixedRange(), torch.randn(1, 8, 4)),
+        (CastRange(), torch.randn(1, 4)),
     ],
 )
 def test_both_frontends_emit_the_same_ir(model, example):
@@ -436,15 +440,46 @@ def test_a_range_sized_by_the_input_depends_on_it_in_both_frontends():
         assert td.Edge(source.id, arange.id) in graph.edges, backend
 
 
-def test_a_range_of_a_fixed_size_is_left_unconnected():
-    """The recovery reports what the model reads a size from, and a hardcoded length reads nothing.
+def test_a_range_of_a_fixed_size_is_left_unconnected_in_both_frontends():
+    """The recovery reports what the model reads a size from, and a hardcoded length reads nothing."""
+    for backend in ("fx", "export"):
+        graph = td.trace(FixedRange(), torch.randn(1, 8, 4), backend=backend)
+        arange = next(node for node in graph.nodes if node.op == "arange")
+        assert [edge for edge in graph.edges if edge.target == arange.id] == []
 
-    Asked of the export frontend only: fx constant-folds a range with no traced input into a tensor attribute before
-    the frontend ever sees it, so there is no range node there to ask about.
+
+def test_a_tensor_built_from_nothing_is_an_operation_in_both_frontends():
+    """A range with no traced input is still something the model does, not a constant that was always there.
+
+    fx has no proxy to trace such a call through, so left alone it runs the call and keeps the result as a tensor
+    attribute, drawing a buffer box under a name torch invented. Holding the factory back makes it a node again.
     """
-    graph = td.trace(FixedRange(), torch.randn(1, 8, 4), backend="export")
-    arange = next(node for node in graph.nodes if node.op == "arange")
-    assert [edge for edge in graph.edges if edge.target == arange.id] == []
+    for backend in ("fx", "export"):
+        graph = td.trace(FixedRange(), torch.randn(1, 8, 4), backend=backend)
+        assert [node.label for node in graph.nodes if node.op not in ("input", "output")] == [
+            "arange",
+            "Embedding",
+            "add",
+            "Linear",
+        ]
+
+
+def test_a_dtype_cast_draws_the_same_box_in_both_frontends():
+    """`x.float()` is a method of its own to fx and one more overload of `to` to export; the diagram says `to`."""
+    for backend in ("fx", "export"):
+        graph = td.trace(CastRange(), torch.randn(1, 4), backend=backend)
+        assert [node.label for node in graph.nodes if node.op == "to"] == ["to"]
+
+
+def test_a_range_the_model_iterates_still_traces():
+    """A factory held back as a node breaks a model that wants the tensor itself, so that trace is retried without it.
+
+    Iterating a range is the plainest case: there is no symbolic stand-in for one, and a model that traced before the
+    factories were held back has to keep tracing.
+    """
+    graph = td.trace(LoopedRange(), torch.randn(1, 4), backend="fx")
+    graph.validate()
+    assert [node.label for node in graph.nodes if node.op == "add"] == ["add", "add"]
 
 
 def test_one_subscript_in_a_submodule_applied_twice_stays_two_boxes():
