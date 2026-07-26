@@ -40,6 +40,12 @@ def test_cli_input_shape_repeats_for_a_multi_input_model(tmp_path):
     assert "1×8" in content
 
 
+def test_cli_rejects_an_input_shape_the_model_cannot_run(tmp_path):
+    """A wrong --input-shape exits with a line about the input, not a traceback through torch."""
+    with pytest.raises(SystemExit, match="does not run through this model"):
+        main(["tests.models:TinyCNN", "-o", str(tmp_path / "out.svg"), "--input-shape", "1,3,28,28"])
+
+
 def test_cli_rejects_bad_import_path():
     """A non-importable model spec exits with a clear error."""
     with pytest.raises(SystemExit, match="cannot import"):

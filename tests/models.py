@@ -137,6 +137,59 @@ class MixedDepthStack(nn.Module):
         return self.stage2(self.stage1(x))
 
 
+class WideningBlock(nn.Module):
+    """Holds its convolutions in a bare ``nn.Sequential`` one level down, which no operation is traced from."""
+
+    def __init__(self) -> None:
+        """Initialize two convolutions of unequal width inside a Sequential."""
+        super().__init__()
+        self.layers = nn.Sequential(nn.Conv2d(3, 4, 3, padding=1), nn.Conv2d(4, 8, 3, padding=1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the convolution stack."""
+        return self.layers(x)
+
+
+class ThreeLevelNet(nn.Module):
+    """A custom block around a bare ``nn.Sequential`` around leaf layers — the nesting torchvision models use."""
+
+    def __init__(self) -> None:
+        """Initialize the block and the pooling head."""
+        super().__init__()
+        self.block = WideningBlock()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the block, then pool."""
+        return self.pool(self.block(x))
+
+
+class DelegatingBlock(nn.Module):
+    """Its ``forward()`` only calls its children, so no operation is ever traced at its own scope."""
+
+    def __init__(self) -> None:
+        """Initialize the layer stack."""
+        super().__init__()
+        self.layers = nn.Sequential(nn.Linear(8, 8), nn.ReLU())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the layer stack."""
+        return self.layers(x)
+
+
+class DelegatingStack(nn.Module):
+    """Three identical delegating blocks — repeats a level that owns no operation has to keep countable."""
+
+    def __init__(self, num_blocks: int = 3) -> None:
+        """Initialize the stack of delegating blocks."""
+        super().__init__()
+        self.blocks = nn.Sequential(*[DelegatingBlock() for _ in range(num_blocks)])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run every block in sequence."""
+        return self.blocks(x)
+
+
 class ClassifierHead(nn.Module):
     """A model whose head is a bare ``nn.Sequential``, whose class name says nothing about what it does."""
 
@@ -266,6 +319,196 @@ class UnusedBranch(nn.Module):
         return self.used(x)
 
 
+class ComposedEncoder(nn.Module):
+    """Built out of torch's own composite layers rather than hand-written blocks.
+
+    ``nn.TransformerEncoderLayer`` is a leaf to fx and a stack of nine children to a naive reading of an export graph,
+    which is the shape on which the two frontends stopped agreeing.
+    """
+
+    def __init__(self, num_blocks: int = 2) -> None:
+        """Initialize the input projection and the stack of encoder layers."""
+        super().__init__()
+        self.proj = nn.Linear(8, 8)
+        self.blocks = nn.Sequential(
+            *[nn.TransformerEncoderLayer(8, 2, 16, batch_first=True) for _ in range(num_blocks)]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Project, then run the encoder stack."""
+        return self.blocks(self.proj(x))
+
+
+class CroppedHead(nn.Module):
+    """Subscripts its input before projecting — one Python expression each tracer lowers its own way."""
+
+    def __init__(self) -> None:
+        """Initialize the projection."""
+        super().__init__()
+        self.proj = nn.Linear(4, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Take the first position, drop its last feature, and project."""
+        return self.proj(x[:, 0, :-1])
+
+
+class SequenceTagger(nn.Module):
+    """A recurrent tagger — a layer returning ``(output, state)``, where only the output is used."""
+
+    def __init__(self) -> None:
+        """Initialize the recurrent layer and the classifier head."""
+        super().__init__()
+        self.rnn = nn.LSTM(4, 6, num_layers=2, batch_first=True, bidirectional=True)
+        self.fc = nn.Linear(12, 3)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the sequence through the recurrent layer and classify every position."""
+        out, _ = self.rnn(x)
+        return self.fc(out)
+
+
+class SubscriptedLayer(nn.Module):
+    """Subscripts a layer that returns a plain tensor — indexing, not the tuple unpacking it looks like."""
+
+    def __init__(self) -> None:
+        """Initialize the convolution."""
+        super().__init__()
+        self.conv = nn.Conv2d(3, 4, kernel_size=3, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Convolve, then take the first item of the batch."""
+        return self.conv(x)[0]
+
+
+class TokenPrefix(nn.Module):
+    """Mixes a learned token and a learned position embedding into the flow, the way a ViT does."""
+
+    def __init__(self) -> None:
+        """Initialize the projection, the class token, and the position embedding."""
+        super().__init__()
+        self.proj = nn.Linear(4, 4)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, 4))
+        self.pos_embed = nn.Parameter(torch.zeros(1, 4, 4))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Prepend the class token, add the position embedding, and project."""
+        x = torch.cat([self.cls_token.expand(x.shape[0], -1, -1), x], dim=1) + self.pos_embed
+        return self.proj(x)
+
+
+class SiameseTower(nn.Module):
+    """Applies one encoder to two inputs — two boxes on the diagram, one set of weights in the model."""
+
+    def __init__(self) -> None:
+        """Initialize the shared encoder and the scoring head."""
+        super().__init__()
+        self.encode = nn.Linear(4, 6)
+        self.score = nn.Linear(6, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode both halves of the input with the same layer and score their difference."""
+        return self.score(self.encode(x) - self.encode(x * 2))
+
+
+class NamedOutput(nn.Module):
+    """Holds a submodule called ``output`` — a name the diagram's own output box wants too."""
+
+    def __init__(self) -> None:
+        """Initialize the stem and the head, the latter named ``output``."""
+        super().__init__()
+        self.stem = nn.Linear(4, 4)
+        self.output = nn.Linear(4, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the stem, then the head."""
+        return self.output(self.stem(x))
+
+
+class NestedReturn(nn.Module):
+    """Returns a tensor and a tuple of two more — the shape a detector returning `(x, (p3, p4))` has."""
+
+    def __init__(self) -> None:
+        """Initialize the stem and the two heads."""
+        super().__init__()
+        self.stem = nn.Linear(4, 4)
+        self.left = nn.Linear(4, 2)
+        self.right = nn.Linear(4, 3)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Return the stem features alongside both head predictions."""
+        h = self.stem(x)
+        return h, (self.left(h), self.right(h))
+
+
+class RepeatedCall(nn.Module):
+    """Applies one layer twice in a row, with nothing in between to separate the two calls."""
+
+    def __init__(self) -> None:
+        """Initialize the single layer."""
+        super().__init__()
+        self.fc = nn.Linear(4, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the layer to its own output."""
+        return self.fc(self.fc(x))
+
+
+class StateOnlyTagger(nn.Module):
+    """Keeps only the recurrent layer's final state, which is a tuple inside a tuple."""
+
+    def __init__(self) -> None:
+        """Initialize the recurrent layer and the classifier."""
+        super().__init__()
+        self.rnn = nn.LSTM(4, 6, batch_first=True)
+        self.fc = nn.Linear(6, 3)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Classify from the final hidden state."""
+        _, (hidden, _) = self.rnn(x)
+        return self.fc(hidden[-1])
+
+
+class OutputOnlyTagger(nn.Module):
+    """Selects the recurrent layer's output at one index only, never touching the state."""
+
+    def __init__(self) -> None:
+        """Initialize the recurrent layer and the classifier."""
+        super().__init__()
+        self.rnn = nn.LSTM(4, 6, batch_first=True)
+        self.fc = nn.Linear(6, 3)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Classify every position of the output sequence."""
+        return self.fc(self.rnn(x)[0])
+
+
+class TiedStack(nn.Module):
+    """Lists one layer object twice in an nn.Sequential — two boxes, one set of weights, no repeat count."""
+
+    def __init__(self) -> None:
+        """Initialize the stack from a single shared layer."""
+        super().__init__()
+        shared = nn.Linear(4, 4)
+        self.body = nn.Sequential(shared, shared)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the stack."""
+        return self.body(x)
+
+
+class NumberedReuse(nn.Module):
+    """Applies a container at a numeric submodule path twice, which the two tracers used to number differently."""
+
+    def __init__(self) -> None:
+        """Initialize the reused block."""
+        super().__init__()
+        self.body = nn.Sequential(nn.Linear(4, 4), nn.ReLU())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the block to its own output."""
+        return self.body(self.body(x))
+
+
 class DualEncoder(nn.Module):
     """Two towers scored against each other — a model whose ``forward()`` takes more than one tensor."""
 
@@ -308,3 +551,70 @@ class NeedsConstructorArgs(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the linear classifier."""
         return self.fc(x)
+
+
+class ChainedSubscript(nn.Module):
+    """Subscripts twice in one expression — what fx splits in two and export cannot split at all."""
+
+    def __init__(self) -> None:
+        """Initialize the projection."""
+        super().__init__()
+        self.proj = nn.Linear(4, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Take one slot out of the first group, then project it."""
+        return self.proj(x[0][1])
+
+
+class SteppedSubscripts(nn.Module):
+    """The same two subscripts a line apart, which a reader wrote as two steps and both frontends keep as two."""
+
+    def __init__(self) -> None:
+        """Initialize the projection."""
+        super().__init__()
+        self.proj = nn.Linear(4, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Take the first group, then one slot out of it, then project."""
+        group = x[0]
+        slot = group[1]
+        return self.proj(slot)
+
+
+class FixedRange(nn.Module):
+    """Builds a range of a fixed size, owing nothing to its input — the constant a recovered shape read is not."""
+
+    def __init__(self) -> None:
+        """Initialize the position embedding and the output projection."""
+        super().__init__()
+        self.pos = nn.Embedding(16, 4)
+        self.proj = nn.Linear(4, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Add a position embedding of a fixed length, then project."""
+        return self.proj(x + self.pos(torch.arange(8)))
+
+
+class Slice(nn.Module):
+    """Drops the first item of whatever it is given — one subscript, in a submodule that gets applied twice."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return everything but the first item."""
+        return x[1:]
+
+
+class SlicedTwice(nn.Module):
+    """Applies the same one-subscript submodule twice, on two lines — two operations sharing one source line."""
+
+    def __init__(self) -> None:
+        """Initialize the two slicing steps and the projection."""
+        super().__init__()
+        self.first = Slice()
+        self.second = Slice()
+        self.proj = nn.Linear(4, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Slice twice, then project."""
+        first = self.first(x)
+        second = self.second(first)
+        return self.proj(second)

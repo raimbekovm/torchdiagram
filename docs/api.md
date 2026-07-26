@@ -81,6 +81,9 @@ An ordered model graph. Node order in `nodes` is the topological (execution) ord
 | `name`  | `str`        | `"model"` | Diagram title.            |
 | `nodes` | `list[Node]` | `[]`      | Nodes in execution order. |
 | `edges` | `list[Edge]` | `[]`      | Directed data-flow edges. |
+| `scopes` | `dict[str, str]` | `{}` | Container modules by dotted path, mapped to class name. |
+
+`Graph.scopes` maps every container module the traced nodes sit under to its class name, including the levels that own no operation of their own. Those levels are no node's `scope`, so without the map the module tree has holes and `aggregate_blocks()` cannot walk past them. It is empty for a hand-built graph.
 
 **`Graph.validate() -> None`** — raises `ValueError` on duplicate node ids or edges that reference unknown node ids. Called automatically by `render()`.
 

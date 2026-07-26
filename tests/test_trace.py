@@ -2,16 +2,33 @@
 
 import pytest
 import torch
+from torch import nn
 
 import torchdiagram as td
 from tests.models import (
+    ChainedSubscript,
+    ComposedEncoder,
+    CroppedHead,
     DualEncoder,
+    FixedRange,
     GatedNet,
+    NamedOutput,
+    NestedReturn,
+    NumberedReuse,
+    OutputOnlyTagger,
     PyramidHeads,
     RepeatedBlockStack,
+    RepeatedCall,
     ResidualBlock,
+    SequenceTagger,
     ShapeMath,
+    SiameseTower,
+    SlicedTwice,
+    StateOnlyTagger,
+    SteppedSubscripts,
+    SubscriptedLayer,
     TinyCNN,
+    TokenPrefix,
     UnusedBranch,
 )
 
@@ -181,6 +198,14 @@ def test_single_return_keeps_one_plain_output_node():
         (UnusedBranch(), torch.randn(1, 4)),
         (DualEncoder(), (torch.randn(1, 4), torch.randn(1, 8))),
         (PyramidHeads(), torch.randn(1, 3, 8, 8)),
+        (ComposedEncoder(), torch.randn(1, 5, 8)),
+        (TokenPrefix(), torch.randn(1, 3, 4)),
+        (SiameseTower(), torch.randn(1, 4)),
+        (CroppedHead(), torch.randn(1, 3, 5)),
+        (ChainedSubscript(), torch.randn(3, 4, 4)),
+        (SteppedSubscripts(), torch.randn(3, 4, 4)),
+        (ShapeMath(), torch.randn(1, 8, 4)),
+        (SlicedTwice(), torch.randn(6, 4, 4)),
     ],
 )
 def test_both_frontends_emit_the_same_ir(model, example):
@@ -196,6 +221,158 @@ def test_both_frontends_emit_the_same_ir(model, example):
 
     assert fields(by_fx) == fields(by_export)
     assert sorted((e.source, e.target) for e in by_fx.edges) == sorted((e.source, e.target) for e in by_export.edges)
+
+
+def test_torch_composite_layer_draws_one_box_in_both_frontends():
+    """A torch.nn composite is a leaf to both frontends: one box, not a box plus its nine children."""
+    example = torch.randn(1, 5, 8)
+    for backend in ("fx", "export"):
+        labels = [node.label for node in td.trace(ComposedEncoder(), example, backend=backend).nodes]
+        assert sum(label.startswith("TransformerEncoderLayer") for label in labels) == 2
+        # The children of an encoder layer are only ever drawn if the descent didn't stop at the layer itself.
+        assert "MultiheadAttention" not in labels
+
+
+def test_subscripting_a_tensor_gets_one_label_from_both_frontends():
+    """`x[:, 0, :-1]` is one operation to a reader, whichever way the tracer lowered it."""
+    example = torch.randn(1, 3, 5)
+    for backend in ("fx", "export"):
+        ops = [node.op for node in td.trace(CroppedHead(), example, backend=backend).nodes]
+        assert "index" in ops
+        assert "getitem" not in ops
+        assert "slice" not in ops
+
+
+def test_a_leaf_layer_traced_on_its_own_keeps_its_class_and_config():
+    """Pointing the tool at a bare layer draws that layer, not the functional ops fx descends into."""
+    graph = td.trace(nn.Linear(4, 6), torch.randn(1, 4))
+    graph.validate()
+    layer = graph.nodes[1]
+    assert layer.label == "Linear"
+    assert "in_features=4" in layer.params["config"]
+    assert [node.output_shape for node in graph.nodes] == [(1, 4), (1, 6), (1, 6)]
+
+
+def test_a_leaf_layer_traced_on_its_own_needs_no_example_input():
+    """The layer box is drawn from the module itself, so it works without shapes, like every other model."""
+    labels = [node.label for node in td.trace(nn.Conv2d(1, 8, 3)).nodes]
+    assert labels == ["input", "Conv2d", "output"]
+
+
+def test_a_layer_returning_a_tuple_is_one_box_carrying_its_real_shape():
+    """`out, _ = self.rnn(x)` is a layer, not a layer plus two boxes of Python syntax."""
+    example = torch.randn(1, 5, 4)
+    for backend in ("fx", "export"):
+        graph = td.trace(SequenceTagger(), example, backend=backend)
+        graph.validate()
+        assert [node.label for node in graph.nodes] == ["input", "LSTM", "Linear", "output"]
+        # (4, 1, 6) is the final hidden state, which is a real tensor the layer produces but not the one that leaves.
+        assert next(node for node in graph.nodes if node.label == "LSTM").output_shape == (1, 5, 12)
+
+
+def test_subscripting_a_layers_tensor_output_stays_on_the_diagram():
+    """`self.conv(x)[0]` indexes a tensor; only unpacking a tuple return folds into the layer."""
+    graph = td.trace(SubscriptedLayer(), torch.randn(2, 3, 8, 8))
+    assert [node.op for node in graph.nodes] == ["input", "conv2d", "index", "output"]
+
+
+def test_tuple_unpacking_folds_without_an_example_input():
+    """With no shapes to propagate, a layer selected from at two indices is still a tuple return."""
+    assert [node.label for node in td.trace(SequenceTagger()).nodes] == ["input", "LSTM", "Linear", "output"]
+
+
+def test_a_parameter_used_in_forward_gets_its_own_box():
+    """A class token is a leaf of the data flow with nowhere else to live, so it is drawn rather than dropped."""
+    for backend in ("fx", "export"):
+        graph = td.trace(TokenPrefix(), torch.randn(1, 3, 4), backend=backend)
+        graph.validate()
+        incoming = {node.id: [edge.source for edge in graph.edges if edge.target == node.id] for node in graph.nodes}
+        assert [node.label for node in graph.nodes if node.op == "parameter"] == ["cls_token", "pos_embed"]
+        # An addition of a tensor and a learned embedding has two operands, not one.
+        assert sorted(incoming["add"]) == ["cat", "pos_embed"]
+
+
+def test_a_parameters_consumer_is_not_wired_to_whatever_supplied_a_shape():
+    """`cls_token.expand(x.shape[0], ...)` takes its data from the token; the batch size is not a data edge."""
+    graph = td.trace(TokenPrefix(), torch.randn(1, 3, 4))
+    expand = next(node for node in graph.nodes if node.op == "expand")
+    assert [edge.source for edge in graph.edges if edge.target == expand.id] == ["cls_token"]
+
+
+def test_a_layer_applied_twice_is_marked_as_one_set_of_weights():
+    """Two boxes for one layer is the honest picture of the data flow; claiming two sets of weights is not."""
+    for backend in ("fx", "export"):
+        graph = td.trace(SiameseTower(), torch.randn(1, 4), backend=backend)
+        shared = [node for node in graph.nodes if "shared_with" in node.params]
+        assert [node.label for node in shared] == ["Linear (encode, call 1)", "Linear (encode, call 2)"]
+        assert shared[0].params["shared_with"] == [shared[1].id]
+
+
+def test_a_mismatched_example_input_is_reported_in_the_users_terms():
+    """The model traced fine; the tensor was wrong. The error says which layer rejected it and what it expected."""
+    with pytest.raises(ValueError) as failure:
+        td.trace(TinyCNN(), torch.randn(1, 3, 28, 28))
+    message = str(failure.value)
+    assert "example input (1, 3, 28, 28) does not run through this model" in message
+    assert "layer 'conv' (Conv2d)" in message
+    assert "1 channels, but got 3 channels" in message
+
+
+def test_a_mismatched_example_input_does_not_print_a_stack(capsys):
+    """Shape propagation prints the stack itself from inside torch; the error line is the whole output."""
+    with pytest.raises(ValueError):
+        td.trace(TinyCNN(), torch.randn(1, 3, 28, 28))
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_an_output_box_does_not_collide_with_a_submodule_called_output():
+    """The output box is named after the return it carries, and a model may hold a submodule of that name."""
+    for backend in ("fx", "export"):
+        graph = td.trace(NamedOutput(), torch.randn(1, 4), backend=backend)
+        graph.validate()  # would raise "duplicate node ids: ['output']"
+        assert [node.label for node in graph.nodes if node.op == "output"] == ["output"]
+
+
+def test_a_nested_return_structure_is_flattened():
+    """`return h, (a, b)` returns three tensors; taking the nested tuple at face value drops two of them."""
+    for backend in ("fx", "export"):
+        graph = td.trace(NestedReturn(), torch.randn(1, 4), backend=backend)
+        graph.validate()
+        outputs = [node for node in graph.nodes if node.op == "output"]
+        assert [node.label for node in outputs] == ["output[0]", "output[1]", "output[2]"]
+        # Every head has somewhere to go; a dropped return leaves its producer dangling.
+        assert all(any(edge.source == node.id for edge in graph.edges) for node in graph.nodes if not node.is_io)
+
+
+def test_a_layer_applied_twice_in_a_row_is_two_boxes_in_both_frontends():
+    """Nothing separates the two calls, so the run of ATen ops is unbroken; the call key is what tells them apart."""
+    for backend in ("fx", "export"):
+        labels = [node.label for node in td.trace(RepeatedCall(), torch.randn(1, 4), backend=backend).nodes]
+        assert labels == ["input", "Linear (fc, call 1)", "Linear (fc, call 2)", "output"]
+
+
+def test_nested_tuple_unpacking_folds_into_the_layer():
+    """`_, (h, c) = self.rnn(x)` selects out of the state tuple, one level below what the first fold handled."""
+    for backend in ("fx", "export"):
+        graph = td.trace(StateOnlyTagger(), torch.randn(1, 5, 4), backend=backend)
+        graph.validate()
+        # Both selections out of the layer are folded away; the one left is `hidden[-1]`, a subscript of a tensor.
+        assert [node.label for node in graph.nodes] == ["input", "LSTM", "index", "Linear", "output"]
+
+
+def test_tuple_unpacking_folds_the_same_way_with_and_without_shapes():
+    """--input-shape is documented as adding annotations; it must not also change how many boxes there are."""
+    with_shapes = [node.label for node in td.trace(OutputOnlyTagger(), torch.randn(1, 5, 4)).nodes]
+    without = [node.label for node in td.trace(OutputOnlyTagger()).nodes]
+    assert with_shapes == without == ["input", "LSTM", "Linear", "output"]
+
+
+def test_a_reused_container_at_a_numeric_path_gets_the_same_ids_from_both_frontends():
+    """Fx renumbers off its own node names and strips a trailing `_<digits>`; ids have to come from the path."""
+    example = torch.randn(1, 4)
+    by_fx = [node.id for node in td.trace(NumberedReuse(), example, backend="fx").nodes]
+    by_export = [node.id for node in td.trace(NumberedReuse(), example, backend="export").nodes]
+    assert by_fx == by_export
 
 
 def test_export_graphs_still_aggregate():
@@ -215,3 +392,73 @@ def test_trace_records_scope_for_nested_submodules():
     root = next(node for node in graph.nodes if node.id == "stem")
     assert root.scope is None
     assert root.scope_class is None
+
+
+def test_chained_subscripts_on_one_line_draw_one_box_in_both_frontends():
+    """`x[0][1]` is one indexing step to a reader; fx splits it in two and export cannot, so both collapse it."""
+    example = torch.randn(3, 4, 4)
+    for backend in ("fx", "export"):
+        ops = [node.op for node in td.trace(ChainedSubscript(), example, backend=backend).nodes]
+        assert ops.count("index") == 1, backend
+
+
+def test_subscripts_a_line_apart_keep_a_box_each_in_both_frontends():
+    """The collapse follows the source line, so two subscripts the model wrote as two steps stay two boxes."""
+    example = torch.randn(3, 4, 4)
+    for backend in ("fx", "export"):
+        ops = [node.op for node in td.trace(SteppedSubscripts(), example, backend=backend).nodes]
+        assert ops.count("index") == 2, backend
+
+
+def test_a_subscript_feeding_two_readers_is_not_collapsed():
+    """A result used more than once is a step of its own: collapsing it would drop an edge the model really has."""
+
+    class Fanout(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(4, 2)
+
+        def forward(self, x):
+            group = x[0]
+            return self.proj(group[1]) + self.proj(group[2])
+
+    graph = td.trace(Fanout(), torch.randn(3, 4, 4), backend="fx")
+    assert [node.op for node in graph.nodes].count("index") == 3
+
+
+def test_a_range_sized_by_the_input_depends_on_it_in_both_frontends():
+    """Export folds `x.shape[1]` into a constant, so the dependency is recovered rather than read off the graph."""
+    example = torch.randn(1, 8, 4)
+    for backend in ("fx", "export"):
+        graph = td.trace(ShapeMath(), example, backend=backend)
+        source = next(node for node in graph.nodes if node.op == "input")
+        arange = next(node for node in graph.nodes if node.op == "arange")
+        assert td.Edge(source.id, arange.id) in graph.edges, backend
+
+
+def test_a_range_of_a_fixed_size_is_left_unconnected():
+    """The recovery reports what the model reads a size from, and a hardcoded length reads nothing.
+
+    Asked of the export frontend only: fx constant-folds a range with no traced input into a tensor attribute before
+    the frontend ever sees it, so there is no range node there to ask about.
+    """
+    graph = td.trace(FixedRange(), torch.randn(1, 8, 4), backend="export")
+    arange = next(node for node in graph.nodes if node.op == "arange")
+    assert [edge for edge in graph.edges if edge.target == arange.id] == []
+
+
+def test_one_subscript_in_a_submodule_applied_twice_stays_two_boxes():
+    """Two calls of a slicing submodule are two operations, though both were written on the submodule's one line.
+
+    The source line alone cannot tell them apart, which is why the fold keys on the whole chain of model frames: the
+    call site differs even when the subscript does not. Collapsing them would attribute the second call's output to the
+    first submodule and leave the second doing nothing at all.
+    """
+    example = torch.randn(6, 4, 4)
+    for backend in ("fx", "export"):
+        graph = td.trace(SlicedTwice(), example, backend=backend)
+        index = [node for node in graph.nodes if node.op == "index"]
+        assert [(node.scope, node.output_shape) for node in index] == [
+            ("first", (5, 4, 4)),
+            ("second", (4, 4, 4)),
+        ], backend

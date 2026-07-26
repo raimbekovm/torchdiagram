@@ -5,9 +5,13 @@ import torch
 import torchdiagram as td
 from tests.models import (
     ClassifierHead,
+    ComposedEncoder,
+    DelegatingStack,
     MixedDepthStack,
     NonUniformBlockStack,
     RepeatedBlockStack,
+    ThreeLevelNet,
+    TiedStack,
     TinyCNN,
     TransformerStack,
     WideningStack,
@@ -195,3 +199,31 @@ def test_aggregate_does_not_merge_blocks_with_different_inner_content():
     blocks = [node for node in result.nodes if node.op == "block"]
     assert len(blocks) == 2
     assert all("×" not in block.label for block in blocks)
+
+
+def test_aggregate_badges_repeated_leaf_layers_in_a_container():
+    """N identical layers held directly in an nn.Sequential get a count, the same as N identical custom blocks do."""
+    result = aggregate_blocks(td.trace(ComposedEncoder(3), torch.randn(1, 5, 8)))
+    labels = [node.label for node in result.nodes]
+    assert "TransformerEncoderLayer ×3" in labels
+    badged = next(node for node in result.nodes if node.label.endswith("×3"))
+    assert badged.params["repeats"] == 3
+
+
+def test_aggregate_walks_past_a_container_no_operation_was_traced_from():
+    """A bare nn.Sequential between two custom levels is not where the walk up the module tree stops."""
+    result = aggregate_blocks(td.trace(ThreeLevelNet(), torch.randn(1, 3, 8, 8)))
+    result.validate()
+    assert [node.label for node in result.nodes] == ["input", "WideningBlock", "AdaptiveAvgPool2d", "output"]
+
+
+def test_aggregate_counts_repeats_of_a_block_that_only_calls_its_children():
+    """A block owning no operation of its own is a level like any other, so its repeats are still counted."""
+    result = aggregate_blocks(td.trace(DelegatingStack(), torch.randn(1, 8)))
+    assert [node.label for node in result.nodes] == ["input", "DelegatingBlock ×3", "output"]
+
+
+def test_aggregate_does_not_badge_a_layer_that_is_shared_rather_than_repeated():
+    """`Linear ×2` claims two sets of weights; a layer listed twice in one Sequential has one."""
+    result = aggregate_blocks(td.trace(TiedStack(), torch.randn(1, 4)))
+    assert not any("×" in node.label for node in result.nodes)

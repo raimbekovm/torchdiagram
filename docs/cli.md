@@ -41,6 +41,14 @@ When `--input-shape` is given, the CLI creates a random float tensor of that sha
 torchdiagram my_models:DualEncoder -o dual.svg --input-shape 1,4 --input-shape 1,8
 ```
 
+An input shape the model cannot run is reported as a single line naming the layer that rejected it:
+
+```
+$ torchdiagram my_models:WaveNet -o w.svg --input-shape 1,5,64
+error: example input (1, 5, 64) does not run through this model: layer 'stem' (Conv1d) rejected it — Given
+groups=1, weight of size [32, 1, 1], expected input[1, 5, 64] to have 1 channels, but got 5 channels instead
+```
+
 For models that expect non-float inputs (for example, token indices for an embedding layer), use the Python API and pass an appropriate `example_input` to `trace()`.
 
 ## Examples

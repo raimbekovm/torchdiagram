@@ -22,18 +22,37 @@ import torch
 import torch.fx
 from torch import nn
 
-from .frontend import ExampleInput, append_outputs, as_args, build_edges, qualify_labels, result_keys
-from .graph import Graph, Node
-
-# fx's own leaf-module rule ("a torch.nn built-in that isn't a Sequential"), reused verbatim so that both frontends
-# draw the same box for the same layer instead of each inventing its own notion of a leaf.
-_LEAF_PROBE = torch.fx.Tracer()
+from .frontend import (
+    LEAF_PROBE,
+    ExampleInput,
+    append_outputs,
+    as_args,
+    build_edges,
+    class_name,
+    continues_subscript,
+    normalize_label,
+    parameter_node,
+    qualify_labels,
+    record_scopes,
+    result_keys,
+    unique_id,
+)
+from .graph import Edge, Graph, Node
 
 # Export narrates a failed attempt loudly: draft_export logs a tlparse banner about unsound specialization, and
 # torch.export._trace prints the partial graph straight to stderr with no logger in between. Both are noise here —
 # a failed attempt is the expected path for the models this frontend exists to handle — so _quiet_export() suppresses
 # them and trace_export() says the one thing that matters in a single warning.
 _LOG_PREFIX = "torch"
+
+# Node kinds that legitimately have nothing feeding them, so a missing incoming edge is not a symptom.
+_UNFED = frozenset({"input", "parameter", "buffer"})
+
+_Entries = list[tuple[str, str, object]]
+"""A node's ``nn_module_stack`` as ``(call key, submodule path, class)`` triples, outermost first.
+
+The path names the module; the key names *this call of it*. Export appends ``@1``, ``@2`` and so on to the key when a
+module is applied more than once, which is the only thing separating two calls of one layer in an ATen graph."""
 
 
 def trace_export(model: nn.Module, example_input: ExampleInput, *, name: str | None = None) -> Graph:
@@ -57,7 +76,8 @@ def trace_export(model: nn.Module, example_input: ExampleInput, *, name: str | N
         UserWarning: If the graph had to be specialized on ``example_input``, meaning branches that input does not take
             are missing from the diagram.
     """
-    graph_module, specialized = _export(model, as_args(example_input))
+    args = as_args(example_input)
+    graph_module, specialized = _export(model, args)
     if specialized:
         warnings.warn(
             f"{type(model).__name__} was traced with torch.export and specialized on the example input: branches "
@@ -65,7 +85,7 @@ def trace_export(model: nn.Module, example_input: ExampleInput, *, name: str | N
             UserWarning,
             stacklevel=2,
         )
-    return _build_graph(model, graph_module, name=name or type(model).__name__)
+    return _build_graph(model, graph_module, args, sound=not specialized, name=name or type(model).__name__)
 
 
 def _export(model: nn.Module, args: tuple[torch.Tensor, ...]) -> tuple[torch.fx.GraphModule, bool]:
@@ -126,12 +146,16 @@ def _quiet_export() -> Iterator[None]:
             handler.removeFilter(_drop)
 
 
-def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: str) -> Graph:
+def _build_graph(
+    model: nn.Module, graph_module: torch.fx.GraphModule, args: tuple[torch.Tensor, ...], *, sound: bool, name: str
+) -> Graph:
     """Convert an exported graph module into the IR.
 
     Args:
         model: The original module, used to resolve submodules by the paths recorded in ``nn_module_stack``.
         graph_module: Result of ``ExportedProgram.module()``.
+        args: The example arguments the model was exported with, for re-exporting if a shape read has to be recovered.
+        sound: Whether ``graph_module`` came from a sound export rather than one specialized on ``args``.
         name: Diagram title.
 
     Returns:
@@ -139,47 +163,64 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
     """
     graph = Graph(name=name)
     owner: dict[torch.fx.Node, str] = {}  # every kept fx node, mapped to the IR node that represents it
-    by_module: dict[str, Node] = {}
+    by_call: dict[str, Node] = {}  # nn_module_stack call key -> the box that call of the layer draws as
+    members: dict[str, list[torch.fx.Node]] = {}  # box id -> the ATen ops it covers, in execution order
+    boxes: dict[str, Node] = {}  # box id -> the box, so a run's shape can be resolved after the walk
     used_ids: set[str] = set()
     paths: dict[str, str] = {}  # IR node id mapped to the submodule it came from, for label disambiguation
     plumbing = _plumbing(graph_module)
+    pending = _direct_parameters(model, graph_module, plumbing)  # parameter boxes, held back until first consumed
+    indexing: dict[torch.fx.Node, Node] = {}  # indexing ops, mapped to the box the whole subscript draws as
+    origin: dict[str, torch.fx.Node] = {}  # IR node id -> the ATen op it was built from, for recovering shape reads
+    inputs: dict[str, str] = {}  # placeholder name -> IR node id, the other half of the same recovery
     results: list[tuple[str | None, torch.fx.Node]] = []
 
     for fx_node in graph_module.graph.nodes:
+        record_scopes([(path, cls) for _, path, cls in _stack(fx_node)], graph.scopes)
         if fx_node.op == "output":
             results = _results(graph_module, fx_node)
             continue
         if fx_node.op == "placeholder":
-            node = Node(id=_unique(fx_node.name, used_ids), op="input", label="input", output_shape=_shape(fx_node))
+            node = Node(id=unique_id(fx_node.name, used_ids), op="input", label="input", output_shape=_shape(fx_node))
+            inputs[fx_node.name] = node.id
         elif fx_node.op != "call_function" or fx_node in plumbing:
-            continue  # get_attr parameter plumbing, the synthetic _guards_fn module, and symbolic guard assertions
+            continue  # a layer's own weights, the synthetic _guards_fn module, and symbolic guard assertions
         else:
-            entries = _stack(fx_node)
-            path, module = _leaf_module(model, entries)
+            call, path, module, ancestors = _leaf_module(model, _stack(fx_node))
             if module is None:
                 label = _label(fx_node.target)
-                scope, scope_class = _scope(entries)
+                continued = continues_subscript(fx_node, label, indexing)
+                if continued is not None:
+                    owner[fx_node] = continued.id
+                    continued.output_shape = _shape(fx_node)
+                    indexing[fx_node] = continued
+                    continue
+                scope, scope_class = _scope(ancestors)
                 node = Node(
-                    id=_unique(fx_node.name, used_ids),
+                    # Numbered off the normalized label rather than off export's own node name, which is derived from
+                    # the ATen overload and so would read `slice_1` where fx reads `index`.
+                    id=unique_id(label, used_ids),
                     op=label,
                     label=label,
                     output_shape=_shape(fx_node),
                     scope=scope,
                     scope_class=scope_class,
                 )
-            elif path in by_module:
+                if label == "index":
+                    indexing[fx_node] = node
+            elif call in by_call:
                 # A single layer can lower to several ATen ops (nn.MultiheadAttention becomes 28 of them); they all
-                # belong to one box, and the group's output is whichever op runs last.
-                merged = by_module[path]
-                owner[fx_node] = merged.id
-                merged.output_shape = _shape(fx_node)
+                # belong to one box, whose shape _group_shape() resolves once the whole run is known. Grouping by the
+                # call key rather than the module path keeps a layer applied twice as two boxes, as it is under fx.
+                owner[fx_node] = by_call[call].id
+                members[by_call[call].id].append(fx_node)
                 continue
             else:
                 kind = type(module).__name__
                 extra = module.extra_repr()
-                scope, scope_class = _scope(entries[:-1])  # a layer reports the container holding it, not itself
+                scope, scope_class = _scope(ancestors)  # a layer reports the container holding it, not itself
                 node = Node(
-                    id=_unique(path.replace(".", "_"), used_ids),
+                    id=unique_id(path.replace(".", "_"), used_ids),
                     op=kind.lower(),
                     label=kind,
                     params={"config": extra} if extra else {},
@@ -187,15 +228,181 @@ def _build_graph(model: nn.Module, graph_module: torch.fx.GraphModule, *, name: 
                     scope=scope,
                     scope_class=scope_class,
                 )
-                by_module[path] = node
+                by_call[call] = node
+                members[node.id] = [fx_node]
+                boxes[node.id] = node
                 paths[node.id] = path
+        for upstream in fx_node.all_input_nodes:  # a parameter box appears just before the op that first reads it
+            parameter = pending.pop(upstream, None)
+            if parameter is not None:
+                owner[upstream] = parameter.id
+                graph.nodes.append(parameter)
         owner[fx_node] = node.id
+        origin.setdefault(node.id, fx_node)
         graph.nodes.append(node)
+
+    for node_id, run in members.items():
+        boxes[node_id].output_shape = _group_shape(run)
 
     qualify_labels(graph.nodes, paths)
     graph.edges = build_edges(owner)
-    append_outputs(graph, owner, results, _shape)
+    if sound:
+        _reconnect_shape_reads(model, args, graph, origin, inputs)
+    append_outputs(graph, owner, results, _shape, used_ids)
     return graph
+
+
+def _reconnect_shape_reads(
+    model: nn.Module,
+    args: tuple[torch.Tensor, ...],
+    graph: Graph,
+    origin: dict[str, torch.fx.Node],
+    inputs: dict[str, str],
+) -> None:
+    """Draw the edge into an op whose only input was a tensor's size, which export resolved to a constant.
+
+    ``torch.arange(idx.shape[1])`` really is sized by the input, and fx draws it that way: it records the shape read as
+    nodes, and the edge rebuilder reconnects across them. Export evaluates the same expression at trace time, so the
+    ATen graph holds ``arange(16)`` with nothing linking it to the placeholder, and the box floats with no arrow at all.
+
+    The dependency is recoverable, just not from this graph: exporting again with the input's dimensions marked dynamic
+    leaves the read standing as a ``sym_size`` node, which names the placeholder it came from. That second export costs
+    as much as the first, so it is attempted only for a node that actually floats. Across the reference architectures
+    that means one model of fourteen, but the trigger is the symptom rather than the cause: a model that builds a
+    constant tensor in ``forward()`` (``torch.zeros(4, 1, 256)``) floats one too and pays for an attempt that cannot
+    help it. Narrowing further would mean guessing which constants came from a size, and guessing wrong loses an edge
+    the model really has. Callers on the specialized path skip this entirely — the sound export already failed for
+    them, and this one is the same call.
+
+    If the export fails, or the graphs cannot be matched up, the diagram is left as it was.
+
+    Args:
+        model: The module being traced.
+        args: The example arguments it was exported with.
+        graph: The graph so far, its edges already built. Modified in place.
+        origin: IR node id mapped to the ATen op it was built from.
+        inputs: Placeholder name mapped to the id of the input node drawn for it.
+    """
+    fed = {edge.target for edge in graph.edges}
+    floating = [node for node in graph.nodes if node.op not in _UNFED and node.id not in fed and node.id in origin]
+    if not floating:
+        return
+    dynamic = _export_dynamic(model, args)
+    if dynamic is None:
+        return
+    by_identity = {(fx_node.name, str(fx_node.target)): fx_node for fx_node in dynamic.graph.nodes}
+    for node in floating:
+        source = origin[node.id]
+        match = by_identity.get((source.name, str(source.target)))
+        if match is None:  # the two exports disagree about this node, so there is nothing safe to say about it
+            continue
+        for placeholder in _shape_sources(match):
+            if placeholder in inputs:
+                graph.edges.append(Edge(source=inputs[placeholder], target=node.id))
+
+
+def _export_dynamic(model: nn.Module, args: tuple[torch.Tensor, ...]) -> torch.fx.GraphModule | None:
+    """Export ``model`` with every input dimension left dynamic, so shape reads survive as nodes.
+
+    ``Dim.AUTO`` specializes back any dimension the model turns out to require a fixed value for, so this is the sound
+    export with as little constant folding as torch will agree to — not a claim that the model is shape-generic.
+
+    Args:
+        model: The module being traced.
+        args: The example arguments it was exported with.
+
+    Returns:
+        The exported graph module, or ``None`` if the torch build has no ``Dim.AUTO``, an argument is not a tensor,
+        or the export failed.
+    """
+    auto = getattr(getattr(torch.export, "Dim", None), "AUTO", None)
+    if auto is None:  # torch too old to ask for automatic dynamism
+        return None
+    try:
+        # Building the spec is inside the try as much as the export is: torch.export takes non-tensor arguments, and
+        # only a tensor has dimensions to mark. A recovery that cannot run has to leave the diagram alone, not raise.
+        spec = tuple({axis: auto for axis in range(tensor.dim())} for tensor in args)
+        with _quiet_export(), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return torch.export.export(model, args, dynamic_shapes=spec, strict=False).module()
+    except Exception:
+        return None
+
+
+def _shape_sources(fx_node: torch.fx.Node) -> list[str]:
+    """The placeholders ``fx_node`` reads a size from, found by walking up through symbolic-size nodes only.
+
+    Stopping at the first tensor-valued node is what keeps this to shape reads: a tensor input would already be an edge
+    in the graph built from the first export, and the node would not have been floating.
+
+    Args:
+        fx_node: A node in the dynamically exported graph.
+
+    Returns:
+        Placeholder names, in the order reached.
+    """
+    found: list[str] = []
+    visited: set[torch.fx.Node] = set()
+    queue = list(fx_node.all_input_nodes)
+    while queue:
+        upstream = queue.pop(0)
+        if upstream in visited:
+            continue
+        visited.add(upstream)
+        if upstream.op == "placeholder":
+            if upstream.name not in found:
+                found.append(upstream.name)
+        elif not _is_tensor_valued(upstream.meta.get("val")):
+            queue.extend(upstream.all_input_nodes)
+    return found
+
+
+def _direct_parameters(
+    model: nn.Module, graph_module: torch.fx.GraphModule, plumbing: set[torch.fx.Node]
+) -> dict[torch.fx.Node, Node]:
+    """Build a box for each learned tensor the model reads in its own code, keyed by the node that supplies it.
+
+    Export lifts every parameter to a ``get_attr``, a ``Conv2d``'s weight as much as a class token, so keeping them all
+    would put a box next to every layer. What separates the two is who reads it: a weight is read by an ATen op that
+    resolves back to the leaf layer it belongs inside, while a class token is read by functional code the model wrote
+    itself and has nowhere else to be drawn. That is the same set fx emits ``get_attr`` for.
+
+    Args:
+        model: The original module, for telling a parameter from a buffer.
+        graph_module: Result of ``ExportedProgram.module()``.
+        plumbing: Nodes already destined to be left out, whose reads do not count.
+
+    Returns:
+        Each qualifying ``get_attr`` node mapped to the box it draws as.
+    """
+    direct: dict[torch.fx.Node, Node] = {}
+    for fx_node in graph_module.graph.nodes:
+        if fx_node.op != "get_attr":
+            continue
+        readers = [user for user in fx_node.users if user.op == "call_function" and user not in plumbing]
+        if any(_leaf_module(model, _stack(user))[2] is None for user in readers):
+            direct[fx_node] = parameter_node(model, str(fx_node.target), _shape(fx_node))
+    return direct
+
+
+def _group_shape(members: list[torch.fx.Node]) -> tuple[int, ...] | None:
+    """The shape of the value that actually leaves a coalesced layer.
+
+    One layer lowers to many ATen ops, and the last of them is not always the one whose result leaves. An ``nn.LSTM``'s
+    final internal op computes the hidden state, not the output sequence, so annotating the box with the last op's shape
+    prints ``(4, 1, 256)`` on a layer whose next box is a ``Linear(512, 20)`` — a diagram contradicting itself.
+    ``nn.MultiheadAttention`` happens to end on its output projection, which is why taking the last op looked right.
+
+    Args:
+        members: The ATen ops the layer lowered to, in execution order.
+
+    Returns:
+        The shape of the first op whose result is consumed from outside the group, or of the last op when the layer's
+        result leaves nowhere, as in dead code.
+    """
+    inside = set(members)
+    leaving = [node for node in members if any(user not in inside for user in node.users)]
+    return _shape(leaving[0] if leaving else members[-1])
 
 
 def _results(graph_module: torch.fx.GraphModule, fx_node: torch.fx.Node) -> list[tuple[str | None, torch.fx.Node]]:
@@ -247,30 +454,38 @@ def _out_structure(spec: object) -> tuple[str | None, list[str] | None]:
     return None, None
 
 
-def _leaf_module(model: nn.Module, entries: list[tuple[str, object]]) -> tuple[str, nn.Module | None]:
+def _leaf_module(model: nn.Module, entries: _Entries) -> tuple[str, str, nn.Module | None, _Entries]:
     """Resolve the leaf ``nn.Module`` a node was lowered from, if it was lowered from one.
+
+    The stack is walked **outermost-first**, which is the direction fx applies the same predicate while tracing: the
+    first leaf on the path stops the descent and nothing inside it is ever visited. Asking about the innermost entry
+    instead makes every torch.nn descendant of a torch.nn composite qualify on its own, so an
+    ``nn.TransformerEncoderLayer`` gets drawn as one box *and* as its nine children, and the two frontends disagree
+    about a model neither had trouble tracing.
 
     When the node came from functional code instead, the returned path is still the innermost recorded one, which is
     what scope resolution needs.
 
     Args:
         model: The original module, whose submodule paths ``nn_module_stack`` refers to.
-        entries: The node's ``nn_module_stack`` entries.
+        entries: The node's ``nn_module_stack`` entries, outermost first.
 
     Returns:
-        A ``(path, module)`` pair; ``module`` is ``None`` when the node came from functional code, not a leaf layer.
+        A ``(call key, path, module, ancestors)`` tuple; ``module`` is ``None`` when the node came from functional code
+        rather than a leaf layer, and ``ancestors`` is the entries above the resolved one, for scope resolution.
     """
-    if not entries:
-        return "", None
-    path = entries[-1][0]
-    try:
-        module = model.get_submodule(path)
-    except AttributeError:  # a path export synthesized that the original model doesn't have
-        return path, None
-    return path, module if _LEAF_PROBE.is_leaf_module(module, path) else None
+    for index, (key, path, _) in enumerate(entries):
+        try:
+            module = model.get_submodule(path)
+        except AttributeError:  # a path export synthesized that the original model doesn't have
+            continue
+        if LEAF_PROBE.is_leaf_module(module, path):
+            return key, path, module, entries[:index]
+    last = entries[-1] if entries else ("", "", None)
+    return last[0], last[1], None, entries
 
 
-def _scope(entries: list[tuple[str, object]]) -> tuple[str | None, str | None]:
+def _scope(entries: _Entries) -> tuple[str | None, str | None]:
     """Resolve the immediate custom-container ancestor from ``nn_module_stack`` entries, as the fx frontend does.
 
     Args:
@@ -282,21 +497,20 @@ def _scope(entries: list[tuple[str, object]]) -> tuple[str | None, str | None]:
     """
     if not entries:
         return None, None
-    path, cls = entries[-1]
-    # export records the class as a fully-qualified string, unlike fx, which records the class object itself.
-    return path, cls.rsplit(".", 1)[-1] if isinstance(cls, str) else getattr(cls, "__name__", str(cls))
+    _, path, cls = entries[-1]
+    return path, class_name(cls)
 
 
-def _stack(fx_node: torch.fx.Node) -> list[tuple[str, object]]:
-    """Read ``nn_module_stack`` as ``(path, class)`` entries, dropping the root module fx never records."""
+def _stack(fx_node: torch.fx.Node) -> _Entries:
+    """Read ``nn_module_stack`` as ``(call key, path, class)`` entries, dropping the root module fx never records."""
     stack = fx_node.meta.get("nn_module_stack")
-    return [entry for entry in stack.values() if entry[0]] if stack else []
+    return [(key, path, cls) for key, (path, cls) in stack.items() if path] if stack else []
 
 
 def _label(target: object) -> str:
     """Name a functional node the way the fx frontend would, e.g. ``aten.relu.default`` becomes ``"relu"``."""
     name = getattr(target, "__name__", None) or str(target)
-    return name.split(".")[0]  # ATen overloads report as "relu.default" / "flatten.using_ints"
+    return normalize_label(name.split(".")[0])  # ATen overloads report as "relu.default" / "flatten.using_ints"
 
 
 def _plumbing(graph_module: torch.fx.GraphModule) -> set[torch.fx.Node]:
@@ -357,14 +571,3 @@ def _shape(fx_node: torch.fx.Node) -> tuple[int, ...] | None:
         return tuple(int(dim) for dim in val.shape)
     except TypeError:  # a symbolic dimension, which has no single integer value
         return None
-
-
-def _unique(candidate: str, used: set[str]) -> str:
-    """Return ``candidate``, suffixed if needed, so node ids stay unique across both naming schemes."""
-    node_id = candidate
-    suffix = 1
-    while node_id in used:
-        node_id = f"{candidate}_{suffix}"
-        suffix += 1
-    used.add(node_id)
-    return node_id
