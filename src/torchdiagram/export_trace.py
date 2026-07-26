@@ -30,6 +30,7 @@ from .frontend import (
     build_edges,
     class_name,
     continues_subscript,
+    model_attribute,
     normalize_label,
     parameter_node,
     qualify_labels,
@@ -171,6 +172,7 @@ def _build_graph(
     plumbing = _plumbing(graph_module)
     pending = _direct_parameters(model, graph_module, plumbing)  # parameter boxes, held back until first consumed
     indexing: dict[torch.fx.Node, Node] = {}  # indexing ops, mapped to the box the whole subscript draws as
+    literals: dict[torch.fx.Node, Node] = {}  # lifted-literal reads, mapped to the box the literal draws as
     origin: dict[str, torch.fx.Node] = {}  # IR node id -> the ATen op it was built from, for recovering shape reads
     inputs: dict[str, str] = {}  # placeholder name -> IR node id, the other half of the same recovery
     results: list[tuple[str | None, torch.fx.Node]] = []
@@ -195,6 +197,10 @@ def _build_graph(
                     continued.output_shape = _shape(fx_node)
                     indexing[fx_node] = continued
                     continue
+                written = _continues_literal(fx_node, label, literals)
+                if written is not None:
+                    owner[fx_node] = written.id
+                    continue
                 scope, scope_class = _scope(ancestors)
                 node = Node(
                     # Numbered off the normalized label rather than off export's own node name, which is derived from
@@ -208,6 +214,8 @@ def _build_graph(
                 )
                 if label == "index":
                     indexing[fx_node] = node
+                elif label == "tensor":
+                    literals[fx_node] = node
             elif call in by_call:
                 # A single layer can lower to several ATen ops (nn.MultiheadAttention becomes 28 of them); they all
                 # belong to one box, whose shape _group_shape() resolves once the whole run is known. Grouping by the
@@ -271,8 +279,8 @@ def _reconnect_shape_reads(
     that means one model of fourteen, but the trigger is the symptom rather than the cause: a model that builds a
     constant tensor in ``forward()`` (``torch.zeros(4, 1, 256)``) floats one too and pays for an attempt that cannot
     help it. Narrowing further would mean guessing which constants came from a size, and guessing wrong loses an edge
-    the model really has. Callers on the specialized path skip this entirely — the sound export already failed for
-    them, and this one is the same call.
+    the model really has. Callers on the specialized path skip this entirely — the sound export already failed for them,
+    and this one is the same call.
 
     If the export fails, or the graphs cannot be matched up, the diagram is left as it was.
 
@@ -357,6 +365,30 @@ def _shape_sources(fx_node: torch.fx.Node) -> list[str]:
     return found
 
 
+def _continues_literal(fx_node: torch.fx.Node, label: str, literals: dict[torch.fx.Node, Node]) -> Node | None:
+    """The literal's box, when ``fx_node`` is the in-place detach ATen leaves standing on top of one.
+
+    ``torch.tensor([1., 2.])`` produces a tensor that owns its storage and carries no gradient history, and export
+    spells that as ``lift_fresh_copy`` followed by ``detach_``. Only the first is the literal; the second says nothing
+    about the model, and drawing it puts a box reading ``detach_`` next to every literal a model writes.
+
+    Narrowly the in-place overload, and only over a literal. ``x.detach()`` lowers to ``detach``, the out-of-place one,
+    and is an operation a reader wrote and fx draws — so a model writing ``torch.tensor([...]).detach()`` keeps the two
+    boxes both frontends give it.
+
+    Args:
+        fx_node: The node being converted.
+        label: Its normalized label.
+        literals: Lifted-literal reads seen so far, mapped to the box each draws as.
+
+    Returns:
+        The box to fold into, or ``None`` when this node is one of the model's own.
+    """
+    if label != "detach_" or len(fx_node.all_input_nodes) != 1:
+        return None
+    return literals.get(fx_node.all_input_nodes[0])
+
+
 def _direct_parameters(
     model: nn.Module, graph_module: torch.fx.GraphModule, plumbing: set[torch.fx.Node]
 ) -> dict[torch.fx.Node, Node]:
@@ -377,8 +409,8 @@ def _direct_parameters(
     """
     direct: dict[torch.fx.Node, Node] = {}
     for fx_node in graph_module.graph.nodes:
-        if fx_node.op != "get_attr":
-            continue
+        if fx_node.op != "get_attr" or model_attribute(model, str(fx_node.target)) is None:
+            continue  # not the model's tensor at all, but a literal export lifted out of forward(); see _LITERALS
         readers = [user for user in fx_node.users if user.op == "call_function" and user not in plumbing]
         if any(_leaf_module(model, _stack(user))[2] is None for user in readers):
             direct[fx_node] = parameter_node(model, str(fx_node.target), _shape(fx_node))
@@ -471,8 +503,8 @@ def _leaf_module(model: nn.Module, entries: _Entries) -> tuple[str, str, nn.Modu
         entries: The node's ``nn_module_stack`` entries, outermost first.
 
     Returns:
-        A ``(call key, path, module, ancestors)`` tuple; ``module`` is ``None`` when the node came from functional code
-        rather than a leaf layer, and ``ancestors`` is the entries above the resolved one, for scope resolution.
+        The call key, the submodule path, the module, and the entries above it. ``module`` is ``None`` when the node
+        came from functional code rather than a leaf layer, and the entries are what scope resolution reads.
     """
     for index, (key, path, _) in enumerate(entries):
         try:
